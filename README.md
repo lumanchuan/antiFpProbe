@@ -54,7 +54,7 @@ iperf -c 192.168.3.2
 
 Now check **13122 shell1**: you should see the p0f output. Compare it against the OS fingerprint placed on the **switch server** under:
 
-- `/root/onl-bf-sde/GXC/antiFpProbe/test_p0f`
+- `antiFpProbe/test_p0f`
 
 If the p0f output shown on **13122 shell1** matches the fingerprint you deployed on the switch, then the disguise is successful (e.g., Linux 2.4).
 
@@ -64,11 +64,11 @@ If the p0f output shown on **13122 shell1** matches the fingerprint you deployed
 
 On **13122**, open:
 
-- `/root/GXC/p0f/p0f_db.json`
+- `p0f/p0f_db.json`
 
 Choose the next fingerprint, e.g., `"Mac OS X:10.x"`. Copy the corresponding JSON object to the **switch server** directory:
 
-- `/root/onl-bf-sde/GXC/antiFpProbe/test_p0f`
+- `antiFpProbe/test_p0f`
 
 Remove the previous fingerprint file/object before placing the new one.
 
@@ -141,11 +141,11 @@ Just log in (no additional startup steps are required for this part).
 
 On **13022**, open:
 
-- `/root/GXC/nmap_fp/pzy.json`
+- `nmap_fp/nmap_fp.json`
 
 Copy one JSON entry from it to the **switch server** file:
 
-- `GXC/antiFpProbe/test_nmap/fps.json`
+- `antiFpProbe/test_nmap/fps.json`
 
 Then on **13022**, run:
 
