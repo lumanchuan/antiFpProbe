@@ -1,0 +1,19 @@
+{
+  "df": 1,
+  "line_no": 187,
+  "mss": 0,
+  "olayout": [
+    "mss",
+    "nop",
+    "ws",
+    "sok",
+    "ts"
+  ],
+  "os": "Windows:7 or 8",
+  "packet_size": 60,
+  "raw": "*:128:0:*:8192,2:mss,nop,ws,sok,ts:df,id+:0:Windows:7 or 8",
+  "scale": 2,
+  "ttl": 128,
+  "wsize": 8192,
+  "wsize_raw": "8192"
+}

@@ -1,0 +1,24 @@
+OSDisguise
+Copyright 2026 OSDisguise contributors
+
+Author-owned project code and newly added deployment scripts/documentation are
+licensed under Apache License, Version 2.0. See LICENSE.
+This grant does not replace any third-party notices or grant rights the project
+authors do not own.
+
+Third-party and provenance exceptions:
+- common/util.p4 retains a Barefoot Networks Confidential & Proprietary notice.
+  Comparison with SDE 9.7.0 tna_counter/common/util.p4 found only formatting
+  differences in one parser declaration. It is included in this local handoff
+  at the project owner's request, NOT relicensed as Apache-2.0. Confirm rights
+  before public redistribution; the public export command excludes it.
+- HTML/static/vendor/lucide.min.js retains its upstream ISC license header.
+- Fingerprint JSON files contain experiment profiles and records derived from
+  Nmap/p0f signatures. Their database version/provenance and redistribution
+  terms must be confirmed before public publication. They are not asserted to
+  be Apache-2.0; the conservative public export excludes them.
+- Barefoot/Intel SDE, compilers, firmware, platform libraries, BFRT/PTF, Nmap,
+  p0f, iperf and Python dependencies are external dependencies, not relicensed
+  by this project. No SDK binaries are included in the source package.
+
+See docs/发布说明.md for the release checklist and dependency alternatives.

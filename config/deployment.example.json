@@ -1,0 +1,11 @@
+{
+  "sde": "/opt/bf-sde-9.7.0",
+  "sde_python": "/usr/bin/python3",
+  "web_host": "127.0.0.1",
+  "web_port": 5080,
+  "trusted_hosts": ["127.0.0.1", "localhost", "192.168.30.252"],
+  "sensor_allowed_ips": ["127.0.0.1", "192.168.30.131"],
+  "sensor_url": "http://192.168.30.252:5080/api/p0f/ingest",
+  "switch_label": "Tofino1",
+  "asset_label": "Linux 2.6"
+}

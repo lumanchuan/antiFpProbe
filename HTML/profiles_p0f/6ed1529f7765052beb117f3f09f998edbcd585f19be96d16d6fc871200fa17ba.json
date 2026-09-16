@@ -1,0 +1,19 @@
+{
+  "df": 1,
+  "line_no": 238,
+  "mss": 0,
+  "olayout": [
+    "mss",
+    "nop",
+    "ws",
+    "sok",
+    "ts"
+  ],
+  "os": "FreeBSD:8.x",
+  "packet_size": 60,
+  "raw": "*:64:0:*:65535,3:mss,nop,ws,sok,ts:df,id+:0:FreeBSD:8.x",
+  "scale": 3,
+  "ttl": 64,
+  "wsize": 65535,
+  "wsize_raw": "65535"
+}

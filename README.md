@@ -1,179 +1,81 @@
-# Experiment Procedure
+# OSDisguise：可编程交换机操作系统指纹防御实验系统
 
-## I. p0f Experiment
+[English](README_EN.md) | 简体中文
 
-### 1. Log in to the remote hosts and start the switch program and the p0f sniffer
+基于 **Tofino1 硬件交换机 / Barefoot SDE 9.7.0 / P4_16**，对 Nmap 主动探测响应和 p0f 被动观察的 TCP 指纹进行处理，配套中文网页管理、指纹选择和监测展示。
 
-#### On the switch server
+这是竞赛复现与源码交付目录。可以整体改名或移动；源码不依赖原工程的安装路径。首次部署必须准备相应硬件、合法获得并安装的 SDE 和 Python 依赖，不能在普通电脑上直接运行 Tofino 数据面。
 
-Go to `root/onl-bf-sde/`, open **shell1**, and run:
+## 从哪里开始
+
+1. [部署与环境检查](docs/部署.md)：三台机器、连线、软件环境、初始化、编译和自检。
+2. [Nmap 操作步骤](docs/Nmap.md)：转发基线、主动指纹对抗、扫描及更换指纹。
+3. [p0f 操作步骤](docs/p0f.md)：被动指纹对抗、监听、iperf2 通信及验收。
+4. [HTML 操作步骤](docs/HTML.md)：安装网页环境、启动/停止服务、模式切换、采集器连接。
+5. [架构、限制与排障](docs/架构与排障.md)：就绪与联通的区别、DPDK、Python ABI、识别边界。
+6. [发布说明与来源](docs/发布说明.md)：Apache-2.0 适用范围、第三方声明、脱敏导出。
+7. [验证记录](docs/验证记录.md)：本次实际验证范围和结果。
+
+## 目录
+
+```text
+.
+├── README.md / LICENSE / NOTICE / .gitignore
+├── antiFpProbe.p4                 # Nmap/p0f 编译开关入口
+├── nmap_tofino.p4                 # Nmap 数据面
+├── p0f_tofino.p4                  # p0f 数据面
+├── common/                       # 公共头文件，保留原声明
+├── configs/                      # 示例业务转发表和 ARP 表
+├── config/deployment.example.json# 部署配置示例
+├── test_nmap/                    # Nmap 原控制面与初始指纹
+├── test_p0f/                     # p0f 原控制面、规范化与示例指纹
+├── monitor/scan_monitor/         # 独立监测转发数据面与控制面
+├── HTML/                        # 网页、控制面适配器、采集器、指纹库
+├── scripts/                     # 配置、构建、自检、启动、源码导出
+├── tests/                       # Nmap 单元测试
+└── docs/                        # 中英文部署、实验与发布文档
+```
+
+`build/`、`HTML/runtime/`、`.venv/`、`config/deployment.json` 是部署后生成的本地内容，不属于公开源码。首次收到的目录不携带旧令牌、数据库、日志、抓包或 SSH 密钥。
+
+## 快速路径
+
+以下在 **Tofino1 的项目根目录**执行。`SDE` 指向本机已安装 SDK；不要把示例地址当作自动安装命令。
 
 ```bash
-# Enable the BF (Tofino SDE) environment
-source set_sde.bash
+export SDE=/root/bf-sde-9.7.0
+python3 scripts/configure.py --sde "$SDE"
 
-# Deploy the compiled P4 program to the switch
-./run_switchd.sh -p antiFpProbe
+# PLATFORM_CONFIG 必须是本台交换机已验证可用的硬件配置文件。
+export PLATFORM_CONFIG="$SDE/install/share/p4/targets/tofino/antiFpProbe.conf"
+/usr/bin/python3 scripts/build.py all --platform-config "$PLATFORM_CONFIG"
+/usr/bin/python3 scripts/doctor.py
 ```
 
-If you see `bfshell`, the switch pipeline has started successfully.
+上面的 `PLATFORM_CONFIG` 是现有实验台的例子。新机器没有该文件时，选择**本机 SDE 中已经能正常驱动该交换机的程序配置**，不要求该程序名为 antiFpProbe。构建器仅读取其硬件信息，不复制其旧 P4 程序，也不覆盖 SDK 安装目录。
 
-Then go to `root/onl-bf-sde/`, open **shell2**, and run:
+手动运行：打开两个 Tofino 终端，在各自的项目根目录运行：
 
 ```bash
-# Enable the BF (Tofino SDE) environment
-source set_sde.bash
-
-# Start the control-plane code
-./run_p4_tests.sh -p antiFpProbe -t GXC/antiFpProbe/test_p0f/ --target tofino
+# 终端 1：选择 monitor、nmap 或 p0f
+bash scripts/data.sh nmap
 ```
-
-#### On the NIC server **13122**
-
-Open **shell1** and run:
 
 ```bash
-# Start the p0f sniffer
-p0f -i enp5s0f1
+# 终端 2：等待终端 1 完成初始化，再运行同一模式
+bash scripts/control.sh nmap
 ```
 
-Open **shell2** and run:
+网页运行请看 [HTML.md](docs/HTML.md)。网页首次启动不会自动加载交换机程序；每次切换均需确认当前进程列表。
 
-```bash
-# Start the iperf server
-iperf -s
-```
+## 实验边界
 
-#### On the NIC server **13022**
+- 默认业务链路：nic-1 `192.168.3.1` → Tofino → nic-2 `192.168.3.2`。
+- Nmap 在 nic-1 扫描 nic-2；p0f 在 nic-2 观察 nic-1 发出的 TCP SYN。两者观察对象不同。
+- 三个模式共享一台 ASIC，需要串行切换，不能同时加载。Nmap 与 p0f 分别编译并缓存，切换指纹无需重新编译。
+- 指纹目录包含已有样例和候选记录。格式校验通过不等于所有版本均已通过硬件端到端测试；页面保留实际兼容性限制。
+- 仅在自己拥有或已获授权的测试网络运行扫描、抓包与流量实验。
 
-Open **shell1** and run:
+## 许可
 
-```bash
-iperf -c 192.168.3.2
-```
-
-Now check **13122 shell1**: you should see the p0f output. Compare it against the OS fingerprint placed on the **switch server** under:
-
-- `antiFpProbe/test_p0f`
-
-If the p0f output shown on **13122 shell1** matches the fingerprint you deployed on the switch, then the disguise is successful (e.g., Linux 2.4).
-
----
-
-### 2. Switch to another fingerprint
-
-On **13122**, open:
-
-- `p0f/p0f_db.json`
-
-Choose the next fingerprint, e.g., `"Mac OS X:10.x"`. Copy the corresponding JSON object to the **switch server** directory:
-
-- `antiFpProbe/test_p0f`
-
-Remove the previous fingerprint file/object before placing the new one.
-
-Example JSON:
-
-```json
-{
-  "df": 1,
-  "line_no": 216,
-  "mss": 0,
-  "olayout": [
-    "mss",
-    "nop",
-    "ws",
-    "nop",
-    "nop",
-    "ts",
-    "sok",
-    "eol+1"
-  ],
-  "os": "Mac OS X:10.x",
-  "packet_size": 64,
-  "raw": "*:64:0:*:65535,1:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0:Mac OS X:10.x",
-  "scale": 1,
-  "ttl": 64,
-  "wsize": 65535,
-  "wsize_raw": "65535"
-}
-```
-
----
-
-## II. Nmap Fingerprint Anti-Scanning Experiment
-
-### 1. Log in to the remote hosts and start the switch program
-
-#### On the switch server
-
-Go to `root/onl-bf-sde/`, open **shell1**, and run:
-
-```bash
-# Enable the BF (Tofino SDE) environment
-source set_sde.bash
-
-# Deploy the compiled P4 program to the switch
-./run_switchd.sh -p antiFpProbe
-```
-
-If you see `bfshell`, the switch pipeline has started successfully.
-
-Then go to `root/onl-bf-sde/`, open **shell2**, and run:
-
-```bash
-# Enable the BF (Tofino SDE) environment
-source set_sde.bash
-
-# Start the control-plane code
-./run_p4_tests.sh -p antiFpProbe -t GXC/antiFpProbe/test_nmap/ --target tofino
-```
-
-If you see the message “正在进行Nmap指纹抗测绘” (Nmap fingerprint anti-scanning in progress), the setup is successful.
-
-#### On NIC servers **13022** and **13122**
-
-Just log in (no additional startup steps are required for this part).
-
----
-
-### 2. Change the fingerprint and run the test
-
-On **13022**, open:
-
-- `nmap_fp/nmap_fp.json`
-
-Copy one JSON entry from it to the **switch server** file:
-
-- `antiFpProbe/test_nmap/fps.json`
-
-Then on **13022**, run:
-
-```bash
-nmap -O --osscan-guess --max-os-tries 1 -p 445,80 192.168.3.2
-```
-
-Example JSON:
-
-```json
-{
-  "OS": "Microsoft Windows 7",
-  "ISN": {"s1":2673451493,"s2":3063823411,"s3":3358054297,"s4":3720430087,"s5":366318029,"s6":1990988521},
-  "SEQ": {"SP":"250-260","GCD":"1-6","ISR":"254-264","TI":"RD","TS":"7"},
-  "OPS": {"O1":[{"mss":1460},{"sack":1},{"ts":1}],"O2":[{"mss":1460},{"sack":1},{"ts":1}],"O3":[{"mss":1460},{"nop":1},{"nop":2},{"ts":1}],"O4":[{"mss":1460},{"sack":1},{"ts":1}],"O5":[{"mss":1460},{"sack":1},{"ts":1}],"O6":[{"mss":1460},{"sack":1},{"ts":1}]},
-  "OPS_RAW": {"O1":"M5B4ST11","O2":"M5B4ST11","O3":"M5B4NNT11","O4":"M5B4ST11","O5":"M5B4ST11","O6":"M5B4ST11"},
-  "WIN": {"W1":8192,"W2":8192,"W3":8192,"W4":8192,"W5":8192,"W6":8192},
-  "ECN": {"R":"Y","DF":"Y","T":"123-133","TG":128,"W":8192,"O":[{"mss":1460},{"nop":1},{"nop":2},{"sack":1}],"O_RAW":"M5B4NNS","CC":"N","Q":""},
-  "T1": {"R":"Y","DF":"Y","T":"123-133","TG":128,"S":"O","A":"O|S+","F":"AS","RD":0,"Q":""},
-  "T2": {"R":"Y","DF":"Y","T":"123-133","TG":128,"W":0,"S":"Z","A":"O|S","F":"AR","O":[],"O_RAW":"","RD":0,"Q":""},
-  "T3": {"R":"Y","DF":"Y","T":"123-133","TG":128,"W":0,"S":"Z","A":"O","F":"AR","O":[],"O_RAW":"","RD":0,"Q":""},
-  "T4": {"R":"Y","DF":"Y","T":"123-133","TG":128,"W":0,"S":"O","A":"O","F":"R","O":[],"O_RAW":"","RD":0,"Q":""},
-  "T5": {"R":"Y","DF":"Y","T":"123-133","TG":128,"W":0,"S":"Z","A":"O","F":"AR","O":[],"O_RAW":"","RD":0,"Q":""},
-  "T6": {"R":"Y","DF":"Y","T":"123-133","TG":128,"W":0,"S":"O","A":"O","F":"R","O":[],"O_RAW":"","RD":0,"Q":""},
-  "T7": {"R":"Y","DF":"Y","T":"123-133","TG":128,"W":0,"S":"Z","A":"O","F":"AR","O":[],"O_RAW":"","RD":0,"Q":""},
-  "U1": {"DF":"N","T":"123-133","TG":128,"IPL":356,"UN":0,"RIPL":"G","RID":"G","RIPCK":"G","RUCK":"G","RUD":"G"},
-  "IE": {"DFI":"N","T":"123-133","TG":128,"CD":"Z"},
-  "_class": "Microsoft | Windows | 7 | general purpose",
-  "_cpe": "cpe:/o:microsoft:windows_7 auto"
-}
-```
+作者拥有版权的代码及本次新增部署脚本、文档采用 **Apache License 2.0**，详见 [LICENSE](LICENSE)。第三方文件不自动改为 Apache-2.0，见 [NOTICE](NOTICE) 和 [发布说明](docs/发布说明.md)。目前尚有公共辅助头文件及指纹数据的来源/授权需发布者确认，不能把此目录直接宣称为“全部文件均已完成开源授权审核”。

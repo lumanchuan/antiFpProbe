@@ -1,0 +1,19 @@
+{
+  "df": 1,
+  "line_no": 141,
+  "mss": 16396,
+  "olayout": [
+    "mss",
+    "sok",
+    "ts",
+    "nop",
+    "ws"
+  ],
+  "os": "Linux:2.4.x (loopback)",
+  "packet_size": 60,
+  "raw": "*:64:0:16396:mss*2,0:mss,sok,ts,nop,ws:df,id+:0:Linux:2.4.x (loopback)",
+  "scale": 0,
+  "ttl": 64,
+  "wsize": 32792,
+  "wsize_raw": "mss*2"
+}

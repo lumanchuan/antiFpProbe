@@ -1,0 +1,13 @@
+{
+  "df": 1,
+  "line_no": 216,
+  "mss": 0,
+  "olayout": ["mss", "nop", "ws", "nop", "nop", "ts", "sok", "eol+1"],
+  "os": "Mac OS X:10.x",
+  "packet_size": 64,
+  "raw": "*:64:0:*:65535,1:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0:Mac OS X:10.x",
+  "scale": 1,
+  "ttl": 64,
+  "wsize": 65535,
+  "wsize_raw": "65535"
+}

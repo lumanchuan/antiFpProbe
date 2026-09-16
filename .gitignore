@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.idea/
+.venv/
+build/
+dist/
+HTML/runtime/
+HTML/vendor/
+HTML/vendor_wheels/
+config/deployment.json
+*.pcap
+*.pcapng
+*.log
+*.token
+*.key
+*.pem

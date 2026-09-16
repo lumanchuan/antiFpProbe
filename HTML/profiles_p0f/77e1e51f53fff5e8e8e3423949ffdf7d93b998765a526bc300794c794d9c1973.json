@@ -1,0 +1,22 @@
+{
+  "df": 1,
+  "line_no": 220,
+  "mss": 0,
+  "olayout": [
+    "mss",
+    "nop",
+    "ws",
+    "nop",
+    "nop",
+    "ts",
+    "sok",
+    "eol+1"
+  ],
+  "os": "MacOS X:10.9 or newer (sometimes iPhone or iPad)",
+  "packet_size": 64,
+  "raw": "*:64:0:*:65535,4:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0:MacOS X:10.9 or newer (sometimes iPhone or iPad)",
+  "scale": 4,
+  "ttl": 64,
+  "wsize": 65535,
+  "wsize_raw": "65535"
+}

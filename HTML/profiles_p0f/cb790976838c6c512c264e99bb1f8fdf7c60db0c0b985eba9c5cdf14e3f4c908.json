@@ -1,0 +1,20 @@
+{
+  "df": 1,
+  "line_no": 193,
+  "mss": 1380,
+  "olayout": [
+    "mss",
+    "nop",
+    "nop",
+    "ts",
+    "nop",
+    "ws"
+  ],
+  "os": "Windows:7 (Websense crawler)",
+  "packet_size": 60,
+  "raw": "*:64:0:1380:mss*4,7:mss,nop,nop,ts,nop,ws:df,id+:0:Windows:7 (Websense crawler)",
+  "scale": 7,
+  "ttl": 64,
+  "wsize": 5520,
+  "wsize_raw": "mss*4"
+}

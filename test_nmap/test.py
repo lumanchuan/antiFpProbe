@@ -6,6 +6,9 @@ import traceback
 import json
 from pprint import pprint
 import random
+import struct
+from copy import deepcopy
+from ipaddress import IPv4Address
 
 from bfruntime_client_base_tests import BfRuntimeTest
 import bfrt_grpc.client as gc
@@ -13,6 +16,156 @@ import bfrt_grpc.client as gc
 logger = logging.getLogger('Test')
 if not len(logger.handlers):
     logger.addHandler(logging.StreamHandler())
+
+P1_6_IDS = tuple(range(8, 14))
+ACK_OPS = {'S+': 1, 'S': 2, 'Z': 3, 'O': 4, 'O|S': 2, 'O|S+': 1}
+SEQ_OPS = {'A': 1, 'Z': 2, 'O': 3, 'A|O': 1}
+TCP_FLAGS = {'F': 1, 'S': 2, 'R': 4, 'P': 8, 'A': 16, 'U': 32, 'E': 64, 'C': 128}
+OPTION_SIZES = {'eop': 1, 'nop': 1, 'mss': 4, 'ws': 3, 'sok': 2, 'ts': 10}
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def checked_uint(value, bits, field):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < (1 << bits):
+        raise ValueError('{} must be an unsigned {}-bit integer'.format(field, bits))
+    return value
+
+
+def option_config(options, field='O', slots=10):
+    if not isinstance(options, list):
+        raise ValueError('{} must be a list'.format(field))
+    config = {'mss': 0, 'scale': 0, 'tsval': 232561103, 'tsecr': 0, 'olayout': []}
+    seen = set()
+    for option in options:
+        if not isinstance(option, dict) or len(option) != 1:
+            raise ValueError('{}: each option must contain exactly one key'.format(field))
+        name, value = next(iter(option.items()))
+        if not isinstance(name, str):
+            raise ValueError('{}: option names must be strings'.format(field))
+        name = name.lower()
+        if name == 'mss':
+            kind = 'mss'
+            config['mss'] = checked_uint(value, 16, field + '.mss')
+        elif name == 'w':
+            kind = 'ws'
+            config['scale'] = checked_uint(value, 8, field + '.w')
+        elif name.startswith('nop'):
+            # In this JSON format the value labels a NOP; it is not a repeat count.
+            kind = 'nop'
+        elif name.startswith(('eop', 'eol')):
+            kind = 'eop'
+        elif name == 'sack':
+            kind = 'sok'
+        elif name == 'ts':
+            kind = 'ts'
+        else:
+            raise ValueError('{}: unsupported option {}'.format(field, name))
+        if kind not in ('nop', 'eop') and kind in seen:
+            raise ValueError('{}: duplicate {} cannot be represented by this pipeline'.format(field, name))
+        seen.add(kind)
+        config['olayout'].append(kind)
+    length = sum(OPTION_SIZES[kind] for kind in config['olayout'])
+    padding = (-length) % 4
+    if length + padding > 40 or len(config['olayout']) + padding > slots:
+        raise ValueError('{} exceeds TCP option length or the {} P4 option slots'.format(field, slots))
+    return config
+
+
+def tcp_option_sum(config):
+    encoded = []
+    for kind in config['olayout']:
+        if kind == 'mss':
+            encoded.append(struct.pack('!BBH', 2, 4, config['mss']))
+        elif kind == 'ws':
+            encoded.append(struct.pack('!BBB', 3, 3, config['scale']))
+        elif kind == 'ts':
+            encoded.append(struct.pack('!BBII', 8, 10, config['tsval'], config['tsecr']))
+        else:
+            encoded.append({'eop': b'\x00', 'nop': b'\x01', 'sok': b'\x04\x02'}[kind])
+    raw = b''.join(encoded)
+    raw += b'\x00' * ((-len(raw)) % 4)
+    total = sum(struct.unpack('!{}H'.format(len(raw) // 2), raw)) if raw else 0
+    while total >> 16:
+        total = (total & 0xffff) + (total >> 16)
+    return total
+
+
+def icmp_reply_fields(ie, index):
+    df = {'N': (0, 0), 'Y': (1, 1), 'S': (1, 0), 'O': (0, 1)}[ie['DFI']][index]
+    cd = ie.get('CD', 'Z')
+    if cd == 'S':
+        code = (9, 0)[index]
+    elif cd == 'Z':
+        code = 0
+    elif cd == 'O':
+        code = (0, 1)[index]
+    else:
+        code = checked_uint(int(cd, 16) if isinstance(cd, str) else cd, 8, 'IE.CD')
+    return df, code
+
+
+def validate_fingerprint(fps):
+    if not isinstance(fps, dict) or not any(k in fps for k in ('T1', 'ECN', 'IE')):
+        raise ValueError('fingerprint must be an object containing T1, ECN or IE')
+    result = deepcopy(fps)
+    for name in ['ECN'] + ['T{}'.format(i) for i in range(1, 8)]:
+        if name not in result:
+            continue
+        rule = result[name]
+        if not isinstance(rule, dict) or rule.get('R', 'Y') not in ('Y', 'N'):
+            raise ValueError('{}: invalid response rule'.format(name))
+        if name == 'ECN' and rule.get('R', 'Y') == 'Y':
+            cc = rule.get('CC', 'N')
+            if cc not in ('N', 'Y', 'S', 'O'):
+                raise ValueError('ECN.CC must be N, Y, S or O in this pipeline')
+            rule.setdefault('F', {'N': 'AS', 'Y': 'ASE', 'S': 'ASEC', 'O': 'ASC'}[cc])
+            rule.setdefault('A', 'S+')
+        if rule.get('R', 'Y') == 'N':
+            result[name] = {'R': 'N'}
+            continue
+        checked_uint(rule.get('TG'), 8, name + '.TG')
+        if rule['TG'] == 0:
+            raise ValueError(name + '.TG must be positive')
+        if rule.get('DF', 'N') not in ('Y', 'N'):
+            raise ValueError(name + '.DF must be Y or N')
+        if 'A' in rule and rule['A'] not in ACK_OPS:
+            raise ValueError(name + '.A is unsupported')
+        if 'S' in rule and rule['S'] not in SEQ_OPS:
+            raise ValueError(name + '.S is unsupported')
+        if not isinstance(rule.get('F', ''), str) or set(rule.get('F', '')) - set(TCP_FLAGS):
+            raise ValueError(name + '.F contains unsupported TCP flags')
+        checked_uint(rule.get('W', 0), 16, name + '.W')
+        option_config(rule.get('O', []), name + '.O')
+    if 'T1' in result and result['T1'].get('R', 'Y') == 'Y':
+        for key in ('ISN', 'WIN', 'OPS'):
+            if not isinstance(result.get(key), dict):
+                raise ValueError('T1 replies require the top-level {} object'.format(key))
+        for i in range(1, 7):
+            checked_uint(result['ISN'].get('s{}'.format(i)), 32, 'ISN.s{}'.format(i))
+            checked_uint(result['WIN'].get('W{}'.format(i)), 16, 'WIN.W{}'.format(i))
+            option_config(result['OPS'].get('O{}'.format(i)), 'OPS.O{}'.format(i))
+    if 'IE' in result:
+        ie = result['IE']
+        if not isinstance(ie, dict) or ie.get('R', 'Y') not in ('Y', 'N'):
+            raise ValueError('IE: invalid response rule')
+        if ie.get('R', 'Y') == 'Y':
+            checked_uint(ie.get('TG'), 8, 'IE.TG')
+            if ie.get('DFI') not in ('Y', 'N', 'S', 'O'):
+                raise ValueError('IE.DFI must be Y, N, S or O')
+            icmp_reply_fields(ie, 0)
+    return result
+
+
+def upsert(table, target, keys, data):
+    # Only ALREADY_EXISTS permits an entry_mod fallback; propagate other failures.
+    for key, value in zip(keys, data):
+        try:
+            table.entry_add(target, [key], [value])
+        except gc.BfruntimeReadWriteRpcException as error:
+            errors = error.sub_errors_get()
+            if not errors or any(item.canonical_code != 6 for _, item in errors):
+                raise
+            table.entry_mod(target, [key], [value])
 
 
 """
@@ -39,8 +192,7 @@ def generate_opt_str(m_opt_dict, _key):
                 opt_list.append("MSS(mss={})".format(opt_val))
 
             elif 'nop' in opt_name:
-                for i in range(opt_val):
-                    opt_list.append("NOP")
+                opt_list.append("NOP")
 
             elif 'w' in opt_name:
                 opt_list.append("WS(scale={})".format(opt_val))
@@ -50,7 +202,7 @@ def generate_opt_str(m_opt_dict, _key):
 
             elif 'eol' in opt_name:
                 opt_list.append("EOL")
-            
+
             elif 'TSval' in opt_name:
                 tsval = opt_val
                 if tsval != -1 and tsecr != -1:
@@ -88,14 +240,14 @@ class NMAP_Test(BfRuntimeTest):
     p4_name = "antiFpProbe"
     client_id = 0
 
-    attacker_port = 176
-    emulator_port = 184
-    recirec_port = 68
+    attacker_port = 60
+    emulator_port = 52
+    recirec_port = 196
 
     arp_ip_dict = {}
     tx_mac_dict = { 
-        184 : "64:9d:99:ff:fd:63",
-        176 : "9c:69:b4:65:0f:5d"
+        60 : "9c:69:b4:65:0f:5d",
+        52 : "64:9d:99:ff:fd:63"
     }
     ipv4_port_fwd_rule_dict = {}
     refresh_table_tuple_list = []
@@ -107,6 +259,14 @@ class NMAP_Test(BfRuntimeTest):
 
     def setUp(self):
         BfRuntimeTest.setUp(self, self.client_id, self.p4_name)
+        self.arp_ip_dict = {}
+        self.ipv4_port_fwd_rule_dict = {}
+        self.refresh_table_tuple_list = []
+        self.fp_ip_dict = {}
+        self.port_speed_dict = {}
+        self.port_statistic_dict = {}
+        self.active_fingerprint = None
+        self.last_config_error = None
     
     def clear_table(self, table_name):
         bfrt_info = self.interface.bfrt_info_get(self.p4_name)
@@ -121,7 +281,7 @@ class NMAP_Test(BfRuntimeTest):
         Loop_Back = {0:"BF_LPBK_NONE", 1:"BF_LPBK_MAC_NEAR"}
         port_lst = [
             {
-                "port" : 176,
+                "port" : 52,
                 "speed" : Speed_dict["100G"],
                 "fec" : Fec_dict["RS"],
                 "an" : AN_dict[0],
@@ -129,29 +289,32 @@ class NMAP_Test(BfRuntimeTest):
 
             },
             {
-                "port" : 184,
+                "port" : 60,
                 "speed" : Speed_dict["100G"],
                 "fec" : Fec_dict["RS"],
                 "an" : AN_dict[0],
                 "lpbk" : Loop_Back[0]
             }
         ]
+        existing = {key.to_dict()['$DEV_PORT']['value']
+                    for _, key in self.port_table.entry_get(target, [], {'from_hw': False})}
         for index, item in enumerate(port_lst, 1):
-            self.port_table.entry_add(
-                target,
-                [self.port_table.make_key([gc.KeyTuple('$DEV_PORT', item["port"])])],
-                [
-                    self.port_table.make_data(
-                        [
-                            gc.DataTuple('$SPEED', str_val=item["speed"]),
-                            gc.DataTuple('$FEC', str_val=item["fec"]),
-                            gc.DataTuple('$AUTO_NEGOTIATION',str_val=item["an"]),
-                            gc.DataTuple('$LOOPBACK_MODE',str_val=item["lpbk"]),
-                            gc.DataTuple('$PORT_ENABLE', bool_val=True)
-                        ]
-                    )
-                ]
-            )
+            if item['port'] not in existing:
+                self.port_table.entry_add(
+                    target,
+                    [self.port_table.make_key([gc.KeyTuple('$DEV_PORT', item["port"])])],
+                    [
+                        self.port_table.make_data(
+                            [
+                                gc.DataTuple('$SPEED', str_val=item["speed"]),
+                                gc.DataTuple('$FEC', str_val=item["fec"]),
+                                gc.DataTuple('$AUTO_NEGOTIATION',str_val=item["an"]),
+                                gc.DataTuple('$LOOPBACK_MODE',str_val=item["lpbk"]),
+                                gc.DataTuple('$PORT_ENABLE', bool_val=True)
+                            ]
+                        )
+                    ]
+                )
             self.port_statistic_dict[item["port"]] = {
                 "port":item["port"], "tx_pkts":0, "tx_MB":0, "rx_pkts":0, "rx_MB":0
             }
@@ -261,9 +424,66 @@ class NMAP_Test(BfRuntimeTest):
 
     def clear_refresh_tuple_for_ip(self, target):
         self.fp_ip_dict.clear()
-        for _table, _key in self.refresh_table_tuple_list:
+        # The entry gate is installed last; remove it before changing reply rules.
+        while self.refresh_table_tuple_list:
+            _table, _key = self.refresh_table_tuple_list[-1]
             _table.entry_del(target, _key)
-        self.refresh_table_tuple_list.clear()
+            self.refresh_table_tuple_list.pop()
+
+    def track_existing_fingerprint(self, tables, host_ip, target):
+        expected_ip = int(IPv4Address(host_ip))
+        for table in tables:
+            for _, key in table.entry_get(target, [], {'from_hw': False}):
+                if key is None:
+                    continue
+                fields = key.to_dict()
+                ip_field = fields.get('ig_md.dst_ipv4', fields.get('hdr.ipv4.dst_addr'))
+                if not ip_field or ip_field.get('prefix_len', 32) != 32:
+                    continue
+                value = ip_field['value']
+                if isinstance(value, (bytes, bytearray)):
+                    value = int.from_bytes(value, 'big')
+                elif isinstance(value, str):
+                    value = int(IPv4Address(value))
+                if value == expected_ip:
+                    self.add_refresh_table_tuple([key], table)
+
+    def refresh_fingerprint(self, path, tables, host_ip, target):
+        try:
+            with open(path, 'r') as source:
+                fps = validate_fingerprint(json.load(source))
+        except (OSError, ValueError, TypeError) as error:
+            if self.active_fingerprint is None:
+                raise
+            if str(error) != self.last_config_error:
+                logger.error('Invalid fingerprint; retaining active rules: %s', error)
+                self.last_config_error = str(error)
+            return False
+        self.last_config_error = None
+        if fps == self.active_fingerprint:
+            return False
+
+        def install(config):
+            self.handle_fp_rules(tables[0], tables[1], tables[2], 0, host_ip,
+                                 config.get('OS', 'unspecified'), config, target)
+            self.add_filter_P1_6_table_rulers(tables[3], host_ip, target)
+            self.add_confuse_enter_rule(tables[4], host_ip, target)
+
+        previous = self.active_fingerprint
+        self.clear_refresh_tuple_for_ip(target)
+        try:
+            install(fps)
+        except Exception:
+            logger.exception('Fingerprint update failed')
+            self.clear_refresh_tuple_for_ip(target)
+            if previous is None:
+                raise
+            install(previous)
+            logger.error('Restored previous fingerprint rules')
+            return False
+        self.active_fingerprint = deepcopy(fps)
+        logger.info('Applied fingerprint for %s: %s', host_ip, fps.get('OS', 'unspecified'))
+        return True
     
     def add_opt_end_rule(self, finger_option_tables, table_id, ip, pkt_seq, target):
         key = [
@@ -280,11 +500,8 @@ class NMAP_Test(BfRuntimeTest):
                 'SwitchIngress.finger_Tcp_opt_end_{}'.format(table_id)
             )
         ]
+        upsert(finger_option_tables, target, key, data)
         self.add_refresh_table_tuple(key, finger_option_tables)
-        try:
-            finger_option_tables.entry_add(target, key, data)
-        except:
-            finger_option_tables.entry_mod(target, key, data)
 
     def add_opt_nop_rule(self, finger_option_tables, table_id, ip, pkt_seq, target):
         key = [
@@ -301,11 +518,8 @@ class NMAP_Test(BfRuntimeTest):
                 'SwitchIngress.finger_Tcp_opt_Nop_{}'.format(table_id)
             )
         ]
+        upsert(finger_option_tables, target, key, data)
         self.add_refresh_table_tuple(key, finger_option_tables)
-        try:
-            finger_option_tables.entry_add(target, key, data)
-        except:
-            finger_option_tables.entry_mod(target, key, data)
 
     def add_opt_mss_rule(self, finger_option_tables, table_id, ip, mss, pkt_seq, target):
         key = [
@@ -322,11 +536,8 @@ class NMAP_Test(BfRuntimeTest):
                 'SwitchIngress.finger_Tcp_opt_MSS_{}'.format(table_id)
             )
         ]
+        upsert(finger_option_tables, target, key, data)
         self.add_refresh_table_tuple(key, finger_option_tables)
-        try:
-            finger_option_tables.entry_add(target, key, data)
-        except:
-            finger_option_tables.entry_mod(target, key, data)
 
     def add_opt_wsize_rule(self, finger_option_tables, table_id, ip, scale, pkt_seq, target):
         key = [
@@ -343,11 +554,8 @@ class NMAP_Test(BfRuntimeTest):
                 'SwitchIngress.finger_Tcp_opt_Wsize_{}'.format(table_id)
             )
         ]
+        upsert(finger_option_tables, target, key, data)
         self.add_refresh_table_tuple(key, finger_option_tables)
-        try:
-            finger_option_tables.entry_add(target, key, data)
-        except:
-            finger_option_tables.entry_mod(target, key, data)
 
     def add_opt_sok_rule(self, finger_option_tables, table_id, ip, pkt_seq, target):
         key = [
@@ -364,13 +572,10 @@ class NMAP_Test(BfRuntimeTest):
                 'SwitchIngress.finger_Tcp_opt_SOK_{}'.format(table_id)
             )
         ]
+        upsert(finger_option_tables, target, key, data)
         self.add_refresh_table_tuple(key, finger_option_tables)
-        try:
-            finger_option_tables.entry_add(target, key, data)
-        except:
-            finger_option_tables.entry_mod(target, key, data)
 
-    def add_opt_ts_rule(self, finger_option_tables, table_id, ip, pkt_seq, target):
+    def add_opt_ts_rule(self, finger_option_tables, table_id, ip, pkt_seq, target, tsval, tsecr):
         key = [
             finger_option_tables.make_key(
                 [
@@ -381,15 +586,12 @@ class NMAP_Test(BfRuntimeTest):
         ]
         data = [
             finger_option_tables.make_data(
-                [], 
+                [gc.DataTuple('tsval', tsval), gc.DataTuple('tsecr', tsecr)],
                 'SwitchIngress.finger_Tcp_opt_TS_{}'.format(table_id)
             )
         ]
+        upsert(finger_option_tables, target, key, data)
         self.add_refresh_table_tuple(key, finger_option_tables)
-        try:
-            finger_option_tables.entry_add(target, key, data)
-        except:
-            finger_option_tables.entry_mod(target, key, data)
 
     """
         负责 把选项拼装逻辑下发到 P4（每个槽的动作），
@@ -406,6 +608,12 @@ class NMAP_Test(BfRuntimeTest):
         ip                 = rule_tuple[1]
         os                 = rule_tuple[2]
         opt_config_dict    = rule_tuple[3]
+        layout = opt_config_dict.get('olayout', [])
+        if any(kind not in OPTION_SIZES for kind in layout):
+            raise ValueError('Unsupported TCP option layout')
+        length = sum(OPTION_SIZES[kind] for kind in layout)
+        if length + (-length) % 4 > 40 or len(layout) + (-length) % 4 > len(finger_option_tables):
+            raise ValueError('TCP options exceed header length or available P4 slots')
         raw_data_offset    = 20
         new_data_offset    = 0
         new_ipv4_len_delta = 0
@@ -449,14 +657,15 @@ class NMAP_Test(BfRuntimeTest):
                     raw_data_offset += 2
 
                 elif option == 'ts': # 10B
-                    self.add_opt_ts_rule(finger_option_tables[index], index, ip, pkt_seq, target)
+                    self.add_opt_ts_rule(finger_option_tables[index], index, ip, pkt_seq, target,
+                                         opt_config_dict['tsval'], opt_config_dict['tsecr'])
                     # print("\toption {:2d}: timestamp, type=8, length=10, ts={}:{}".format(_id, fps['tsval'], fps['tsecr']))
                     options.append("TS(ts={})".format(opt_config_dict['tsval']))
                     raw_data_offset += 10
 
         
         table_id = len(options)
-        while (raw_data_offset % 4 != 0 and table_id <= 9):
+        while raw_data_offset % 4 != 0:
             self.add_opt_end_rule(finger_option_tables[table_id], table_id, ip, pkt_seq, target)
             raw_data_offset += 1
             table_id += 1
@@ -479,7 +688,7 @@ class NMAP_Test(BfRuntimeTest):
     def handle_fp_rules(self, handle_T1_7_table, finger_option_tables, 
             handle_icmp_table, rule_type, hostIP, host_type, fps, target
         ):
-        
+        fps = validate_fingerprint(fps)
         self.fp_ip_dict[hostIP] = {"ruleType":rule_type, "OS": host_type}
 
        
@@ -498,38 +707,19 @@ class NMAP_Test(BfRuntimeTest):
             seq_from_isn       = 0
             opt_dict_list      = []
             opt_config_dict = {'mss':0, 'scale':0, 'ts':0, 'olayout':[]}
-            ack_op_dict = {
-                "S+": 1,   # ack_eq_seq_plus_one
-                "S": 2,    # ack eq seq
-                "Z": 3,    # ack set zero
-                "O": 4,    # ack set other
-                "O|S": 2,
-                "O|S+": 1,
-            }       
-            seq_op_dict = {
-                "A": 1, # seq_eq_ack
-                "Z": 2, # seq set zero
-                "O": 3,  # seq set other
-                "A|O": 1
-            }
             should_reply_dict = {
                 "Y" : 1,
                 "N" : 0
             }  
 
             if 'A' in raw_fps:
-                ack_opcode = ack_op_dict[raw_fps['A']]
+                ack_opcode = ACK_OPS[raw_fps['A']]
             if 'DF' in raw_fps and raw_fps['DF'] == 'Y':
                 ipv4_flags |= (1<<1)
             if 'S' in raw_fps:
-                seq_opcode = seq_op_dict[raw_fps['S']]
+                seq_opcode = SEQ_OPS[raw_fps['S']]
             if 'F' in raw_fps:
-                if 'A' in raw_fps['F']: # ACK
-                    tcp_flags |= (1 << 4)
-                if 'R' in raw_fps['F']: # RST
-                    tcp_flags |= (1 << 2)
-                if 'S' in raw_fps['F']: # SYN
-                    tcp_flags |= (1 << 1)
+                tcp_flags = sum(TCP_FLAGS[flag] for flag in set(raw_fps['F']))
             if 'W' in raw_fps:
                 tcp_wsize = raw_fps['W']
             if 'R' in raw_fps:
@@ -540,57 +730,15 @@ class NMAP_Test(BfRuntimeTest):
             #     ipv4_ttl = min_v
             if 'TG' in raw_fps:
                 ipv4_ttl = int(raw_fps['TG'])
-            if 'O' in raw_fps: # options
-                opt_dict_list = raw_fps['O']
-                opt_config_dict = {'mss':0, 'scale':0, 'tsval':0, 'tsecr':0, 'olayout':[]}
-                # ts_dup = False
-                print("raw options list:{}".format(opt_dict_list))
-                for opt_dict in opt_dict_list:
-                    for _opt_name, _opt_val in opt_dict.items():
-                        _opt_name = _opt_name.lower()
-                        if 'mss' == _opt_name:
-                            opt_config_dict['olayout'].append('mss')
-                            opt_config_dict['mss'] = _opt_val
-                        elif 'nop' in _opt_name:
-                            opt_config_dict['olayout'].append('nop')
-                        elif 'eop' in _opt_name:
-                            opt_config_dict['olayout'].append('eol+1')
-                        elif 'w' == _opt_name:
-                            opt_config_dict['olayout'].append('ws')
-                            opt_config_dict['scale'] = _opt_val
-                        elif 'sack' == _opt_name:
-                            opt_config_dict['olayout'].append('sok')
-                        elif 'ts' == _opt_name:
-                            opt_config_dict['tsval'] = 4294967295
-                            opt_config_dict['tsecr'] = 0
-                            opt_config_dict['olayout'].append('ts')
-            if _pkt_seq > 7:
+            opt_config_dict = option_config(raw_fps.get('O', []))
+            if _pkt_seq in P1_6_IDS and should_reply:
                 tcp_wsize = win
-                opt_config_dict = {'mss':0, 'scale':0, 'tsval':0, 'tsecr':0, 'olayout':[]}
-                # ts_dup = False
-                if 'ISN' in raw_fps:
-                    seq_from_isn = isn if isn != 0 else random.randint(1, 0xFFFFFFFF)
-                print("P1-P6 options list:{}".format(ops_lst))
-                for opt_dict in ops_lst:
-                    for _opt_name, _opt_val in opt_dict.items():
-                        _opt_name = _opt_name.lower()
-                        if 'mss' == _opt_name:
-                            opt_config_dict['olayout'].append('mss')
-                            opt_config_dict['mss'] = _opt_val
-                        elif 'nop' in _opt_name:
-                            opt_config_dict['olayout'].append('nop')
-                        elif 'eop' in _opt_name:
-                            opt_config_dict['olayout'].append('eol+1')
-                        elif 'w' == _opt_name:
-                            opt_config_dict['olayout'].append('ws')
-                            opt_config_dict['scale'] = _opt_val
-                        elif 'sack' == _opt_name:
-                            opt_config_dict['olayout'].append('sok')
-                        elif 'ts' == _opt_name:
-                            opt_config_dict['tsval'] = 4294967295
-                            opt_config_dict['tsecr'] = 0
-                            opt_config_dict['olayout'].append('ts')
-
+                opt_config_dict = option_config(ops_lst)
+                # ISN lives at the JSON root. Zero is a valid supplied ISN.
+                seq_from_isn = checked_uint(isn, 32, 'ISN')
+            elif seq_opcode == 3 and should_reply:
+                # S=O must not silently turn into the S=Z case for T3/ECN.
+                seq_from_isn = random.randint(1, 0xFFFFFFFF)
 
             # insert into option insertion table
             new_data_offset, new_ipv4_len_delta, options_fp_data = self.add_fp_option_rule(
@@ -623,16 +771,17 @@ class NMAP_Test(BfRuntimeTest):
                         gc.DataTuple('m_seq_no_opcode',      seq_opcode),
                         gc.DataTuple('should_reply',         should_reply),
                         gc.DataTuple('m_seq_from_isn',       seq_from_isn),
+                        gc.DataTuple('m_tcp_option_sum',     tcp_option_sum(opt_config_dict)),
                     ], 
                     'SwitchIngress.hdr_fp_setup'
                 )
             ]
 
-            handle_T1_7_table.entry_add(target, key, data)
+            upsert(handle_T1_7_table, target, key, data)
 
             self.add_refresh_table_tuple(key, handle_T1_7_table)
             
-            self.fp_ip_dict[hostIP]["Seq-{:x}".format(_pkt_seq)] = ";".join(
+            self.fp_ip_dict[hostIP]["Seq-{:d}".format(_pkt_seq)] = ";".join(
                 [
                     "Reply={}".format(should_reply), 
                     "TTL={}".format(ipv4_ttl), 
@@ -644,6 +793,7 @@ class NMAP_Test(BfRuntimeTest):
                     "Dof={}".format( new_data_offset), 
                     "ACKop={}".format(ack_opcode), 
                     "SEQop={}".format(seq_opcode),
+                    "ISN={}".format(seq_from_isn),
                     "OPS={}".format( options_fp_data)
                 ]
             )
@@ -651,19 +801,17 @@ class NMAP_Test(BfRuntimeTest):
         print(">>>   generate_hdr_fp_data")
         # insert ECN and T1~T7
         if 'ECN' in fps:
-            # TCP flags
-            if "F" not in fps['ECN'] or fps['ECN']['F'] != 'AS':
-                fps['ECN']['F'] = 'AS'
-            if "A" not in fps['ECN']:
-                fps['ECN']['A'] = 'S+'
             generate_hdr_fp_data(fps['ECN'], 0x1)
         if 'T1' in fps:
-            generate_hdr_fp_data(fps['T1'], 0x8, fps.get("WIN", {}).get("W1", 512), fps.get("OPS").get("O1", {}),fps["ISN"]["s1"])
-            generate_hdr_fp_data(fps['T1'], 0x9, fps.get("WIN", {}).get("W2", 512), fps.get("OPS").get("O2", {}),fps["ISN"]["s2"])
-            generate_hdr_fp_data(fps['T1'], 0x10, fps.get("WIN", {}).get("W3", 512), fps.get("OPS").get("O3", {}),fps["ISN"]["s3"])
-            generate_hdr_fp_data(fps['T1'], 0x11, fps.get("WIN", {}).get("W4", 512), fps.get("OPS").get("O4", {}),fps["ISN"]["s4"])
-            generate_hdr_fp_data(fps['T1'], 0x12, fps.get("WIN", {}).get("W5", 512), fps.get("OPS").get("O5", {}),fps["ISN"]["s5"])
-            generate_hdr_fp_data(fps['T1'], 0x13, fps.get("WIN", {}).get("W6", 512), fps.get("OPS").get("O6", {}),fps["ISN"]["s6"])
+            for index, packet_id in enumerate(P1_6_IDS, 1):
+                if fps['T1'].get('R', 'Y') == 'N':
+                    generate_hdr_fp_data(fps['T1'], packet_id)
+                    continue
+                generate_hdr_fp_data(
+                    fps['T1'], packet_id,
+                    fps.get('WIN', {}).get('W{}'.format(index)),
+                    fps.get('OPS', {}).get('O{}'.format(index)),
+                    fps.get('ISN', {}).get('s{}'.format(index)))
         if 'T2' in fps:
             generate_hdr_fp_data(fps['T2'], 0x2)
         if 'T3' in fps:
@@ -680,65 +828,24 @@ class NMAP_Test(BfRuntimeTest):
         if 'IE' in fps:
             self.fp_ip_dict[hostIP]['IE'] = []
             ie_dict = fps['IE']
-            if 'R' not in ie_dict or ie_dict['R'] == 'Y':
-                # ttl_min = int(ie_dict['T'].split('-')[0])
-                # ttl_max = int(ie_dict['T'].split('-')[1])
-                ttl = ie_dict['TG']
-                # icmp_ttl = random.randint(ttl_min, ttl_max)
-                icmp_ttl = ttl
-                keys = []
-                datas = []
-                # 1th reply
-                keys.append(
-                    handle_icmp_table.make_key(
-                        [
-                            gc.KeyTuple('hdr.ipv4.diffserv[5:0]', 0),
-                            gc.KeyTuple('hdr.icmp.code', 9),
-                            gc.KeyTuple('hdr.icmp_data.seq', 295),
-                            gc.KeyTuple('ig_md.dst_ipv4', gc.ipv4_to_bytes(hostIP), prefix_len=32)
-                        ]
-                    )
-                )
-                if ie_dict['DFI'] == 'Y':
-                    datas.append(
-                        handle_icmp_table.make_data(
-                            [gc.DataTuple('ttl', icmp_ttl)], 
-                            'SwitchIngress.generate_icmp_reply'
-                        )
-                    )
-                    self.fp_ip_dict[hostIP]['IE'].append(
-                        "1th echo reply: TOS=0,icmp_code=9,icmp_seq=295,IP={},action=Reply(TTL={})".format(hostIP, icmp_ttl)
-                    )
+            for index, (tos, code, seq) in enumerate(((0, 9, 295), (4, 0, 296))):
+                key = handle_icmp_table.make_key([
+                    gc.KeyTuple('hdr.ipv4.diffserv[5:0]', tos),
+                    gc.KeyTuple('hdr.icmp.code', code),
+                    gc.KeyTuple('hdr.icmp_data.seq', seq),
+                    gc.KeyTuple('ig_md.dst_ipv4', gc.ipv4_to_bytes(hostIP), prefix_len=32)])
+                if ie_dict.get('R', 'Y') == 'N':
+                    data = handle_icmp_table.make_data([], 'SwitchIngress.ignore_icmp_request')
+                    description = 'Ignore'
                 else:
-                    datas.append(
-                        handle_icmp_table.make_data(
-                            [], 
-                            'SwitchIngress.ignore_icmp_request'
-                        )
-                    )
-                    self.fp_ip_dict[hostIP]['IE'].append(
-                        "1th echo reply: TOS=0,icmp_code=9,icmp_seq=295,IP={},action=Ignore".format(hostIP)
-                    )
-                # 2th reply
-                keys.append(
-                    handle_icmp_table.make_key(
-                        [
-                            gc.KeyTuple('hdr.ipv4.diffserv[5:0]', 4),
-                            gc.KeyTuple('hdr.icmp.code', 0),
-                            gc.KeyTuple('hdr.icmp_data.seq', 296),
-                            gc.KeyTuple('ig_md.dst_ipv4', gc.ipv4_to_bytes(hostIP), prefix_len=32)
-                        ]
-                    )
-                )
-                datas.append(
-                    handle_icmp_table.make_data(
-                        [gc.DataTuple('ttl', icmp_ttl)], 
-                        'SwitchIngress.generate_icmp_reply'
-                    )
-                )
-                self.fp_ip_dict[hostIP]['IE'].append("2th echo reply: TOS=4,icmp_code=0,icmp_seq=296,IP={},action=Reply(TTL={})".format(hostIP, icmp_ttl))
-                handle_icmp_table.entry_add(target, keys, datas)
-                self.add_refresh_table_tuple(keys, handle_icmp_table)
+                    df, reply_code = icmp_reply_fields(ie_dict, index)
+                    data = handle_icmp_table.make_data([
+                        gc.DataTuple('ttl', ie_dict['TG']), gc.DataTuple('df', df),
+                        gc.DataTuple('code', reply_code)], 'SwitchIngress.generate_icmp_reply')
+                    description = 'Reply(TTL={}, DF={}, code={})'.format(ie_dict['TG'], df, reply_code)
+                upsert(handle_icmp_table, target, [key], [data])
+                self.add_refresh_table_tuple([key], handle_icmp_table)
+                self.fp_ip_dict[hostIP]['IE'].append('Probe {}: {}'.format(index + 1, description))
 
     def add_filter_P1_6_table_rulers(self, filter_P1_6_table, host_ip, target):
         # rules = [
@@ -776,13 +883,14 @@ class NMAP_Test(BfRuntimeTest):
             datas.append(
                 filter_P1_6_table.make_data(
                     [
-                        gc.DataTuple('seq', index+8)
+                            gc.DataTuple('seq', P1_6_IDS[index])
                     ],
                     'SwitchIngress.set_packet_seq'
                 )
             )
-        filter_P1_6_table.entry_add(target,keys,datas)
-        self.add_refresh_table_tuple(keys, filter_P1_6_table)
+        for key, data in zip(keys, datas):
+            upsert(filter_P1_6_table, target, [key], [data])
+            self.add_refresh_table_tuple([key], filter_P1_6_table)
 
 
 
@@ -799,7 +907,7 @@ class NMAP_Test(BfRuntimeTest):
         ]
         data = [enter_table.make_data([], 'SwitchIngress.mark_packet_to_enter_confuse')]
 
-        enter_table.entry_add(target, key, data)
+        upsert(enter_table, target, key, data)
         self.add_refresh_table_tuple(key, enter_table)
     
     def add_refresh_table_tuple(self, _key, _table):
@@ -828,7 +936,7 @@ class NMAP_Test(BfRuntimeTest):
                 )
             )
         
-        p4_table.entry_add( target, keys, datas)
+        upsert(p4_table, target, keys, datas)
     
     def dump_fwd_rules(self):
         print("****Forward rules:****")
@@ -936,7 +1044,7 @@ class NMAP_Test(BfRuntimeTest):
         self.port_str_info_table = bfrt_info.table_get("$PORT_STR_INFO")
 
         # tables
-        handle_arp_table = bfrt_info.table_get("SwitchIngress.handle_arp_table")
+        # handle_arp_table = bfrt_info.table_get("SwitchIngress.handle_arp_table")
         ipv4_fwd_table = bfrt_info.table_get('SwitchIngress.ipv4_fwd_table')
         filter_packet_enter_confuse_table = bfrt_info.table_get('SwitchIngress.filter_packet_enter_confuse_table')
         preprocess_ipv4_tcp_length_table  = bfrt_info.table_get('SwitchIngress.preprocess_ipv4_tcp_length_table')
@@ -958,102 +1066,70 @@ class NMAP_Test(BfRuntimeTest):
         handle_icmp_table = bfrt_info.table_get('SwitchIngress.handle_icmp_table')
 
         # reg tables
-        # confuse_pkts_reg_table = bfrt_info.table_get('SwitchIngress.confuse_pkts_reg')
-        # bypass_pkts_reg_table = bfrt_info.table_get('SwitchIngress.bypass_pkts_reg')
-        # resubmit_reg_table = bfrt_info.table_get('SwitchIngress.resubmit_reg')
-        # resubmited_reg_table = bfrt_info.table_get('SwitchIngress.resubmited_reg')
-        # ecn_1_to_7_reg_table  = bfrt_info.table_get('SwitchIngress.ecn_1_to_7_reg')
-        # icmp_pkts_reg_table = bfrt_info.table_get('SwitchIngress.icmp_pkts_reg')
-        # icmp_hit_reg_table = bfrt_info.table_get('SwitchIngress.icmp_hit_reg')
-        # udp_pkts_reg_table = bfrt_info.table_get('SwitchIngress.udp_pkts_reg')
-        # tcp_pkts_reg_table = bfrt_info.table_get('SwitchIngress.tcp_pkts_reg')
-        # return_pkts_reg_table = bfrt_info.table_get('SwitchIngress.return_pkts_reg')
+        bypass_pkts_reg_table = bfrt_info.table_get('SwitchIngress.bypass_pkts_reg')
+        confuse_pkts_reg_table = bfrt_info.table_get('SwitchIngress.confuse_pkts_reg')
+        icmp_pkts_reg_table = bfrt_info.table_get('SwitchIngress.icmp_pkts_reg')
+        icmp_hit_reg_table = bfrt_info.table_get('SwitchIngress.icmp_hit_reg')
+        udp_pkts_reg_table = bfrt_info.table_get('SwitchIngress.udp_pkts_reg')
+        tcp_pkts_reg_table = bfrt_info.table_get('SwitchIngress.tcp_pkts_reg')
+        resubmited_reg_table = bfrt_info.table_get('SwitchIngress.resubmited_reg')
+        ecn_1_to_7_reg_table  = bfrt_info.table_get('SwitchIngress.ecn_1_to_7_reg')
+        return_pkts_reg_table = bfrt_info.table_get('SwitchIngress.return_pkts_reg')
+
         # parsed_mss_reg_table = bfrt_info.table_get('SwitchIngress.parsed_mss_reg')
         # parsed_scale_reg_table = bfrt_info.table_get('SwitchIngress.parsed_scale_reg')
         # parsed_ts_reg_table = bfrt_info.table_get('SwitchIngress.parsed_ts_reg')
         # parsed_var_opt_reg_table = bfrt_info.table_get('SwitchIngress.parsed_var_opt_reg')
-
         # reg1_table = bfrt_info.table_get('SwitchIngress.reg1')
 
+        fingerprint_path = os.path.join(TEST_DIR, 'fps.json')
+        # Validate before any table or port changes on startup.
+        with open(fingerprint_path, 'r') as source:
+            validate_fingerprint(json.load(source))
         self.open_port(target)
-        self.load_arp_rules(handle_arp_table, "GXC/antiFpProbe/configs/arp_rules.txt", target)
         self.setup_preprocess_ipv4_tcp_length_rules(preprocess_ipv4_tcp_length_table, target)
-        self.load_ipv4_fwd_rules_from_file(ipv4_fwd_table, "GXC/antiFpProbe/configs/ipv4_fwd_rules.txt", target)
+        self.load_ipv4_fwd_rules_from_file(
+            ipv4_fwd_table, os.path.join(TEST_DIR, '..', 'configs', 'ipv4_fwd_rules.txt'), target)
 
-
-        # def index_to_ip(i):
-        #     x = i - 1  # 0-based
-        #     b = (x >> 16) & 255
-        #     c = (x >> 8)  & 255
-        #     d = x & 255
-        #     return "%d.%d.%d.%d" % (10, b, c, d)
-        
-        # print("正在进行Nmap指纹抗测绘")
-        # for i in range(100):
-        #     rule_type = 0
-        #     host_ip = index_to_ip(i+1)
-        #     host_type = "linux 5.4"
-        #     with open("GXC/antiFpProbe/test_nmap/fps.json", 'r') as file:
-        #         fps = json.load(file)
-        #     self.handle_fp_rules(
-        #         handle_T1_7_table, 
-        #         finger_option_tables, 
-        #         handle_icmp_table,
-        #         rule_type, 
-        #         host_ip,
-        #         host_type, 
-        #         fps, 
-        #         target
-        #     )
-        #     self.add_filter_P1_6_table_rulers(filter_P1_6_table, host_ip, target)
-        #     self.add_confuse_enter_rule(filter_packet_enter_confuse_table, host_ip, target)
-
+        host_ip = '192.168.3.2'
+        refresh_tables = (handle_T1_7_table, finger_option_tables, handle_icmp_table,
+                          filter_P1_6_table, filter_packet_enter_confuse_table)
+        # Adopt only this host's old rules so a controller restart removes stale IDs.
+        self.track_existing_fingerprint(
+            [handle_T1_7_table] + finger_option_tables + [handle_icmp_table,
+             filter_P1_6_table, filter_packet_enter_confuse_table], host_ip, target)
 
         detailed_fp = False
 
         while True:
             os.system("clear")
-            rule_type = 0
-            host_ip = "192.168.3.2"
-            host_type = "linux 5.4"
-            with open("GXC/antiFpProbe/test_nmap/fps.json", 'r') as file:
-                fps = json.load(file)
-
-            self.clear_refresh_tuple_for_ip(target)
-            self.handle_fp_rules(
-                handle_T1_7_table, 
-                finger_option_tables, 
-                handle_icmp_table,
-                rule_type, 
-                host_ip,
-                host_type, 
-                fps, 
-                target
-            )
-            self.add_filter_P1_6_table_rulers(filter_P1_6_table, host_ip, target)
-            self.add_confuse_enter_rule(filter_packet_enter_confuse_table, host_ip, target)
+            self.refresh_fingerprint(fingerprint_path, refresh_tables, host_ip, target)
             print("正在进行Nmap指纹抗测绘")
             # self.dump_reg(reg1_table, 0, 'reg1', target)
-            time.sleep(1)
+
 
             # self.dump_fwd_rules()
             # self.dump_ports_statistic(target)
             # print("\n*** Port ***")
-            # self.dump_reg(confuse_pkts_reg_table, 0, 'confuse_pkts_reg', target)
-            # self.dump_reg(bypass_pkts_reg_table, 0, 'bypass_pkts_reg', target)
+            self.dump_reg(bypass_pkts_reg_table, 0, 'bypass_pkts_reg', target)
+            self.dump_reg(confuse_pkts_reg_table, 0, 'confuse_pkts_reg', target)
+            self.dump_reg(icmp_pkts_reg_table, 0, 'icmp_pkts_reg', target)
+            self.dump_reg(icmp_hit_reg_table, 0, 'icmp_hit_reg', target)
+            self.dump_reg(udp_pkts_reg_table, 0, 'udp_pkts_reg', target)
+            self.dump_reg(tcp_pkts_reg_table, 0, 'tcp_pkts_reg', target)
+            self.dump_reg(resubmited_reg_table, 0, 'resubmited_reg', target)
+            for i in range(15):
+                self.dump_reg(ecn_1_to_7_reg_table, i, 'ecn_1_to_7_reg', target)
+            self.dump_reg(return_pkts_reg_table, 0, 'return_pkts_reg', target)
+
             # self.dump_reg(parsed_mss_reg_table, 0, 'parsed_mss_reg', target)
             # self.dump_reg(parsed_scale_reg_table, 0, 'parsed_scale_reg', target)
             # self.dump_reg(parsed_ts_reg_table, 0, 'parsed_ts_reg', target)
             # self.dump_reg(parsed_var_opt_reg_table, 0, 'parsed_var_opt_reg', target)
-            # self.dump_reg(resubmit_reg_table, 0, 'resubmit_reg', target)
-            # self.dump_reg(resubmited_reg_table, 0, 'resubmited_reg', target)
-            # self.dump_reg(icmp_pkts_reg_table, 0, 'icmp_pkts_reg', target) 
-            # self.dump_reg(icmp_hit_reg_table, 0, 'icmp_hit_reg', target) 
-            # self.dump_reg(udp_pkts_reg_table, 0, 'udp_pkts_reg', target) 
-            # self.dump_reg(tcp_pkts_reg_table, 0, 'tcp_pkts_reg', target) 
-            # self.dump_reg(return_pkts_reg_table, 0, 'return_pkts_reg', target)
-            # for i in range(15):
-            #     self.dump_reg(ecn_1_to_7_reg_table, i, 'ecn_1_to_7_reg', target)
+
+
+
+
             # self.dump_fp_rules(detailed_fp)
 
             # timeout input
@@ -1068,4 +1144,4 @@ class NMAP_Test(BfRuntimeTest):
             #     print('Time out!')
             # else:
             #     pass
-        
+            time.sleep(2)

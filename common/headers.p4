@@ -103,7 +103,6 @@ header tcp_h {
     #elif ENB_P0F
     bit<8> data_offset;
     bit<8> flags;
-    
     #endif
 
     bit<16> window;
@@ -454,6 +453,9 @@ struct metadata_t {
     bool parsed_var_option;
 
     bit<16> icmp_checksum_temp;
+    bit<16> tcp_checksum_temp;
+    bit<16> tcp_option_sum;
+    bool update_icmp_echo_checksum;
     #endif
 
     bit<1> do_ing_mirroring;  // Enable ingress mirroring

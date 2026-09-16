@@ -17,10 +17,32 @@ const bit<6> SYN_FLAG = 1 << 1;
 const bit<6> PSH_FLAG = 1 << 3;
 const bit<6> URG_FLAG = 1 << 5;
 
+struct p0f_metadata_t {
+    ipv4_addr_t dst_ipv4;
+    bool update_ipv4_checksum;
+    bool update_tcp_checksum;
+    bit<16> tcp_length;
+    bit<16> original_header_length;
+    bit<32> original_ts;
+    bool has_original_ts;
+    bit<16> option_sum;
+    bit<32> checksum_ts;
+}
+
+struct linux_syn_options_t {
+    bit<16> mss_kind_length;
+    bit<16> mss;
+    bit<16> sack;
+    bit<16> ts_kind_length;
+    bit<32> tsval;
+    bit<32> tsecr;
+    bit<32> tail;
+}
+
 parser SwitchIngressParser(
         packet_in pkt,
         out headers_t hdr,
-        out metadata_t ig_md,
+        out p0f_metadata_t ig_md,
         out ingress_intrinsic_metadata_t ig_intr_md) {
 
     TofinoIngressParser() tofino_parser;
@@ -30,7 +52,13 @@ parser SwitchIngressParser(
 
         ig_md.update_ipv4_checksum = false;
         ig_md.update_tcp_checksum  = false;
-        ig_md.update_udp_checksum  = false;
+        ig_md.has_original_ts = false;
+        ig_md.original_ts = 0;
+        ig_md.dst_ipv4 = 0;
+        ig_md.tcp_length = 0;
+        ig_md.original_header_length = 0;
+        ig_md.option_sum = 0;
+        ig_md.checksum_ts = 0;
         
         transition parse_ethernet;
     }
@@ -53,8 +81,8 @@ parser SwitchIngressParser(
     state parse_ipv4 {
         pkt.extract(hdr.ipv4);
         ig_md.dst_ipv4 = hdr.ipv4.dst_addr;
-        transition select(hdr.ipv4.protocol) {
-            IP_PROTOCOLS_TCP: parse_tcp;
+        transition select(hdr.ipv4.ihl, hdr.ipv4.mf_bit, hdr.ipv4.frag_offset, hdr.ipv4.protocol) {
+            (5, 0, 0, IP_PROTOCOLS_TCP): parse_tcp;
             default: accept;
         }
     }
@@ -63,12 +91,36 @@ parser SwitchIngressParser(
         pkt.extract(hdr.tcp);
         transition select(hdr.tcp.data_offset[7:4]) {
             4w5: accept;
+            4w10: inspect_linux_syn_options;
+            4w6..4w15: parse_varbit_tcp_option;
+            default: reject;
+        }
+    }
+
+    state inspect_linux_syn_options {
+        linux_syn_options_t options = pkt.lookahead<linux_syn_options_t>();
+        transition select(options.mss_kind_length) {
+            0x0204: inspect_linux_timestamp;
             default: parse_varbit_tcp_option;
         }
     }
+
+    state inspect_linux_timestamp {
+        linux_syn_options_t options = pkt.lookahead<linux_syn_options_t>();
+        ig_md.original_ts = options.tsval;
+        transition select(options.ts_kind_length) {
+            0x080a: found_linux_timestamp;
+            default: parse_varbit_tcp_option;
+        }
+    }
+
+    state found_linux_timestamp {
+        ig_md.has_original_ts = true;
+        transition parse_varbit_tcp_option;
+    }
     
     state parse_varbit_tcp_option{
-        pkt.extract(hdr.option, (((bit<32>)hdr.tcp.data_offset[7:4] * 4) - 20) * 8);
+        pkt.extract(hdr.option, ((bit<32>)(hdr.tcp.data_offset[7:4] - 4w5)) << 5);
         
         transition accept;
     }
@@ -84,10 +136,12 @@ parser SwitchIngressParser(
 control SwitchIngressDeparser(
         packet_out pkt,
         inout headers_t hdr,
-        in metadata_t ig_md,
+        in p0f_metadata_t ig_md,
         in ingress_intrinsic_metadata_for_deparser_t ig_dprsr_md) {
 
     Checksum() ipv4_checksum;
+    Checksum() tcp_checksum;
+
 
     apply {
         if(ig_md.update_ipv4_checksum) {
@@ -110,21 +164,29 @@ control SwitchIngressDeparser(
             );
         }
 
+        if (ig_md.update_tcp_checksum) {
+            hdr.tcp.checksum = tcp_checksum.update({
+                hdr.ipv4.src_addr, hdr.ipv4.dst_addr, 8w0, hdr.ipv4.protocol, ig_md.tcp_length,
+                hdr.tcp.src_port, hdr.tcp.dst_port, hdr.tcp.seq_no, hdr.tcp.ack_no,
+                hdr.tcp.data_offset, hdr.tcp.flags, hdr.tcp.window, hdr.tcp.urgent_ptr,
+                ig_md.option_sum, ig_md.checksum_ts
+            });
+        }
         pkt.emit(hdr);
     }
 }
 
 control SwitchIngress(
         inout headers_t hdr,
-        inout metadata_t ig_md,
+        inout p0f_metadata_t ig_md,
         in ingress_intrinsic_metadata_t  ig_intr_md,
         in ingress_intrinsic_metadata_from_parser_t ig_intr_prsr_md,
         inout ingress_intrinsic_metadata_for_deparser_t ig_intr_dprsr_md,
         inout ingress_intrinsic_metadata_for_tm_t ig_intr_tm_md) {
         
     PortId_t recirc_port = 68; 
-    PortId_t send_port = 176;
-    PortId_t receive_port = 184;
+    PortId_t send_port = 60;
+    PortId_t receive_port = 52;
 
     mac_addr_t new_dst_mac_addr = 48w0;
     bool direct_forward = false;
@@ -134,6 +196,33 @@ control SwitchIngress(
     bit<8> new_ttl = 8w0;
     bit<16> new_wsize = 16w0;
     bit<1> new_df = 1w0;
+    bool requires_ts = false;
+    bit<1> new_ecn = 0;
+
+    action allow_syn_rewrite() { }
+    table plain_syn {
+        key = {
+            hdr.ipv4.total_len: exact;
+            hdr.tcp.data_offset: exact;
+            hdr.tcp.flags[5:0]: ternary;
+        }
+        actions = { allow_syn_rewrite; NoAction; }
+        const default_action = NoAction();
+        size = 11;
+        const entries = {
+            (40, 0x50, 0x02 &&& 0x17): allow_syn_rewrite;
+            (44, 0x60, 0x02 &&& 0x17): allow_syn_rewrite;
+            (48, 0x70, 0x02 &&& 0x17): allow_syn_rewrite;
+            (52, 0x80, 0x02 &&& 0x17): allow_syn_rewrite;
+            (56, 0x90, 0x02 &&& 0x17): allow_syn_rewrite;
+            (60, 0xa0, 0x02 &&& 0x17): allow_syn_rewrite;
+            (64, 0xb0, 0x02 &&& 0x17): allow_syn_rewrite;
+            (68, 0xc0, 0x02 &&& 0x17): allow_syn_rewrite;
+            (72, 0xd0, 0x02 &&& 0x17): allow_syn_rewrite;
+            (76, 0xe0, 0x02 &&& 0x17): allow_syn_rewrite;
+            (80, 0xf0, 0x02 &&& 0x17): allow_syn_rewrite;
+        }
+    }
     
 
 
@@ -222,12 +311,16 @@ control SwitchIngress(
 
     action finger_action_wsize(
         bit<8> ttl, bit<16> wsize, bit<8> m_new_data_offset, 
-        bit<16> m_new_ipv4_len_delta, bit<1> df) {
+        bit<16> m_new_ipv4_len_delta, bit<1> df, bool needs_ts,
+        bit<16> option_sum, bit<1> ecn) {
         new_ttl = ttl;
         new_wsize = wsize;
         new_data_offset = m_new_data_offset;
         new_ipv4_len_delta = m_new_ipv4_len_delta;
         new_df = df;
+        requires_ts = needs_ts;
+        ig_md.option_sum = option_sum;
+        new_ecn = ecn;
     }
     table finger_ob_table {
         key = {
@@ -282,7 +375,7 @@ control SwitchIngress(
         hdr.ts_##X##.setValid(); \
         hdr.ts_##X##.kind  = 0x08; \
         hdr.ts_##X##.length = 0x0a; \
-        hdr.ts_##X##.tsval = 232561103; \
+        hdr.ts_##X##.tsval = ig_md.original_ts; \
         hdr.ts_##X##.tsecr = 0; \
     }
 
@@ -365,19 +458,31 @@ control SwitchIngress(
             //     || hdr.tcp.flags[5:0] == (SYN_FLAG | PSH_FLAG | URG_FLAG))) {
                 
 
-                if(finger_ob_table.apply().hit) {
+                if (plain_syn.apply().hit) {
+                 if(finger_ob_table.apply().hit) {
+                  if(!requires_ts || ig_md.has_original_ts) {
                     if(new_ttl > 0) hdr.ipv4.ttl = new_ttl;
-                    if(new_wsize > 0) hdr.tcp.window = new_wsize;
-                    if(new_df > 0) hdr.ipv4.df_bit = new_df;
+                    hdr.tcp.window = new_wsize;
+                    hdr.ipv4.df_bit = new_df;
+                    hdr.ipv4.diffserv[1:0] = 0;
+                    if (new_ecn == 0) {
+                        hdr.tcp.flags = hdr.tcp.flags & 0x3f;
+                    } else {
+                        hdr.tcp.flags = hdr.tcp.flags | 0xc0;
+                    }
+                    if (requires_ts) {
+                        ig_md.checksum_ts = ig_md.original_ts;
+                    }
 
 
                     /* Drop original option */
                     if(preprocess_ipv4_tcp_length_table.apply().hit) {
                         hdr.option.setInvalid();
-                        hdr.tcp.data_offset = new_data_offset;
-                        hdr.ipv4.total_len = hdr.ipv4.total_len - old_ipv4_len_delta;
-                        hdr.ipv4.total_len = hdr.ipv4.total_len + new_ipv4_len_delta;
                     }
+                    hdr.tcp.data_offset = new_data_offset;
+                    hdr.ipv4.total_len = hdr.ipv4.total_len - old_ipv4_len_delta;
+                    hdr.ipv4.total_len = hdr.ipv4.total_len + new_ipv4_len_delta;
+                    ig_md.tcp_length = 20 + new_ipv4_len_delta;
                 
                     /* finger_ob_tcp_table_##X##.apply(); */
                     APP_TABLE_FP_OB_TCP(0);
@@ -393,12 +498,17 @@ control SwitchIngress(
 
                     ig_md.update_ipv4_checksum = true;
                     ig_md.update_tcp_checksum  = true;
+                  }
+                 }
                 }
             }
 
         }
         else if(ig_intr_md.ingress_port == receive_port){
             ig_intr_tm_md.ucast_egress_port = send_port;
+        }
+        else {
+            drop();
         }
 
         ig_intr_tm_md.bypass_egress = 1w1;

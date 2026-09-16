@@ -62,6 +62,7 @@ parser SwitchIngressParser(
 
     TofinoIngressParser() tofino_parser;
     Checksum() icmp_checksum;
+    Checksum() tcp_checksum;
 
     state start {
         /*如果解析到这些opt就将值变成对应的kind */
@@ -83,6 +84,9 @@ parser SwitchIngressParser(
         ig_md.update_icmp_checksum = false;
         ig_md.update_icmp_ipv4_checksum = false;
         ig_md.icmp_checksum_temp = 16w0;
+        ig_md.tcp_checksum_temp = 16w0;
+        ig_md.tcp_option_sum = 16w0;
+        ig_md.update_icmp_echo_checksum = false;
 
         tofino_parser.apply(pkt, ig_intr_md);
         transition parse_ethernet;
@@ -106,10 +110,7 @@ parser SwitchIngressParser(
     state parse_ipv4 {
         pkt.extract(hdr.ipv4);
         ig_md.dst_ipv4 = hdr.ipv4.dst_addr;
-        icmp_checksum.subtract(hdr.ipv4.ttl);
-        icmp_checksum.subtract(hdr.ipv4.diffserv);
-        icmp_checksum.subtract(hdr.ipv4.src_addr);
-        icmp_checksum.subtract(hdr.ipv4.dst_addr);
+        tcp_checksum.subtract(hdr.ipv4.total_len);
         transition select(hdr.ipv4.protocol) {
             IP_PROTOCOLS_RECIRC_TCP : parse_recirc_tcp; // 回环报文
             IP_PROTOCOLS_TCP  : parse_tcp;              // tcp报文
@@ -121,11 +122,7 @@ parser SwitchIngressParser(
 
     state parse_icmp {
         pkt.extract(hdr.icmp);
-        icmp_checksum.subtract(hdr.icmp.hdr_checksum);
-        icmp_checksum.subtract(hdr.icmp.icmp_type);
-        icmp_checksum.subtract(hdr.icmp.code);
-        // 把当前 icmp_checksum 的中间结果存到元数据 ig_md.icmp_checksum_temp
-        ig_md.icmp_checksum_temp = icmp_checksum.get();
+        icmp_checksum.subtract({hdr.icmp.hdr_checksum, hdr.icmp.icmp_type, hdr.icmp.code});
         transition select(hdr.icmp.icmp_type) {
             8w8: parse_icmp_data; // ping请求
             default: accept; 
@@ -134,6 +131,7 @@ parser SwitchIngressParser(
 
     state parse_icmp_data {
         pkt.extract(hdr.icmp_data);
+        icmp_checksum.subtract_all_and_deposit(ig_md.icmp_checksum_temp);
         transition accept;
     }
 
@@ -174,6 +172,8 @@ parser SwitchIngressParser(
 
     state parse_recirc_tcp {
         pkt.extract(hdr.tcp);
+        // Keep the payload/pseudo-header contribution while replacing TCP headers.
+        tcp_checksum.subtract(hdr.tcp);
         transition select(hdr.tcp.data_offset) {
             {4w12}: parse_fixed_tcp_option_28B;
             {4w11}: parse_fixed_tcp_option_24B;
@@ -190,6 +190,7 @@ parser SwitchIngressParser(
     #define STATE_PARSE_OPTION(X) \
     state parse_fixed_tcp_option_##X##B { \
         pkt.extract(hdr.option_##X##B); \
+        tcp_checksum.subtract(hdr.option_##X##B); \
         transition parse_dummy_option; \
     }
 
@@ -227,6 +228,12 @@ parser SwitchIngressParser(
     // 这是这套管线自己插入的“强结束”标记（在 ingress 里回环前写入），用于回环后解析时立刻停表。             
     state parse_option_deol {
         pkt.advance(1*8);
+        transition deposit_tcp_residual;
+    }
+
+    state deposit_tcp_residual {
+        // Deposit only after consuming the recirculation-only option copy.
+        tcp_checksum.subtract_all_and_deposit(ig_md.tcp_checksum_temp);
         transition accept;
     }
 
@@ -294,8 +301,27 @@ control SwitchIngressDeparser(
     
     Checksum() ipv4_checksum;
     Checksum() icmp_ipv4_checksum;
+    Checksum() tcp_checksum;
+    Checksum() icmp_echo_checksum;
 
     apply {
+        if (ig_md.update_tcp_checksum) {
+            hdr.tcp.checksum = tcp_checksum.update({
+                hdr.ipv4.total_len,
+                hdr.tcp.src_port, hdr.tcp.dst_port,
+                hdr.tcp.seq_no, hdr.tcp.ack_no,
+                hdr.tcp.data_offset, hdr.tcp.res,
+                hdr.tcp.cwr, hdr.tcp.ece, hdr.tcp.urg, hdr.tcp.ack,
+                hdr.tcp.psh, hdr.tcp.rst, hdr.tcp.syn, hdr.tcp.fin,
+                hdr.tcp.window, hdr.tcp.urgent_ptr,
+                ig_md.tcp_option_sum, ig_md.tcp_checksum_temp
+            });
+        }
+        if (ig_md.update_icmp_echo_checksum) {
+            hdr.icmp.hdr_checksum = icmp_echo_checksum.update({
+                hdr.icmp.icmp_type, hdr.icmp.code, ig_md.icmp_checksum_temp
+            });
+        }
         if(ig_md.update_ipv4_checksum) {
             hdr.ipv4.hdr_checksum = ipv4_checksum.update(
                 {
@@ -353,9 +379,9 @@ control SwitchIngress(
     inout ingress_intrinsic_metadata_for_deparser_t ig_intr_dprsr_md,
     inout ingress_intrinsic_metadata_for_tm_t ig_intr_tm_md) {
     
-    PortId_t recirc_port = 68; 
-    PortId_t send_port = 176;
-    PortId_t receive_port = 184;
+    PortId_t recirc_port = 196;
+    PortId_t send_port = 60;
+    PortId_t receive_port = 52;
 
     bool is_from_recirec_port = false;
 
@@ -367,24 +393,61 @@ control SwitchIngress(
     bool do_handle_icmp_unreachable = false;
     bit<1> do_reply       = 1;
 
-    // Register<bit<32>, bit<32>>(1, 32w0) bypass_pkts_reg;        // bypass_pkts_reg：进入 旁路路径 的包数量。
-    // RegisterAction<bit<32>, bit<32>, void>(bypass_pkts_reg) bypass_pkts_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
-    // Register<bit<32>, bit<32>>(1, 32w0) confuse_pkts_reg;       // confuse_pkts_reg：进入 混淆路径 的包数量。
-    // RegisterAction<bit<32>, bit<32>, void>(confuse_pkts_reg) confuse_pkts_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
-    // Register<bit<32>, bit<32>>(1, 32w0) resubmited_reg;     // 真正来自回环口的包数量。
-    // RegisterAction<bit<32>, bit<32>, void>(resubmited_reg) resubmited_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
+    Register<bit<32>, bit<32>>(1, 32w0) bypass_pkts_reg;        // bypass_pkts_reg：进入 旁路路径 的包数量,可以检查arp包。
+    RegisterAction<bit<32>, bit<32>, void>(bypass_pkts_reg) bypass_pkts_add = {
+        void apply(inout bit<32> item) {
+            item = item + 1;
+        }
+    };
+    Register<bit<32>, bit<32>>(1, 32w0) confuse_pkts_reg;       // confuse_pkts_reg：进入 混淆路径 的包数量。
+    RegisterAction<bit<32>, bit<32>, void>(confuse_pkts_reg) confuse_pkts_add = {
+        void apply(inout bit<32> item) {
+            item = item + 1;
+        }
+    };
+    Register<bit<32>, bit<32>>(1, 32w0) icmp_pkts_reg;
+    RegisterAction<bit<32>, bit<32>, void>(icmp_pkts_reg) icmp_pkts_add = {
+        void apply(inout bit<32> item) {
+            item = item + 1;
+        }
+    };
+    Register<bit<32>, bit<32>>(1, 32w0) icmp_hit_reg;       // 统计 ICMP 匹配到应答规则的次数。
+    RegisterAction<bit<32>, bit<32>, void>(icmp_hit_reg) icmp_hit_add = {
+        void apply(inout bit<32> item) {
+            item = item + 1;
+        }
+    };
+    Register<bit<32>, bit<32>>(1, 32w0) udp_pkts_reg;
+    RegisterAction<bit<32>, bit<32>, void>(udp_pkts_reg) udp_pkts_add = {
+        void apply(inout bit<32> item) {
+            item = item + 1;
+        }
+    };
+    Register<bit<32>, bit<32>>(1, 32w0) tcp_pkts_reg;
+    RegisterAction<bit<32>, bit<32>, void>(tcp_pkts_reg) tcp_pkts_add = {
+        void apply(inout bit<32> item) {
+            item = item + 1;
+        }
+    };
+    Register<bit<32>, bit<32>>(1, 32w0) resubmited_reg;     // 真正来自回环口的包数量。
+    RegisterAction<bit<32>, bit<32>, void>(resubmited_reg) resubmited_add = {
+        void apply(inout bit<32> item) {
+            item = item + 1;
+        }
+    };
+    Register<bit<32>, bit<32>>(15, 32w0) ecn_1_to_7_reg;    // 统计对应的探针包
+    RegisterAction<bit<32>, bit<32>, void>(ecn_1_to_7_reg) ecn_1_to_7_add = {
+        void apply(inout bit<32> item) {
+            item = item + 1;
+        }
+    };
+    Register<bit<32>, bit<32>>(1, 32w0) return_pkts_reg;
+    RegisterAction<bit<32>, bit<32>, void>(return_pkts_reg) return_pkts_add = {
+        void apply(inout bit<32> item) {
+            item = item + 1;
+        }
+    };
+
     // Register<bit<32>, bit<32>>(1, 32w0) parsed_mss_reg;
     // RegisterAction<bit<32>, bit<32>, void>(parsed_mss_reg) parsed_mss_add = {
     //     void apply(inout bit<32> item) {
@@ -409,54 +472,8 @@ control SwitchIngress(
     //         item = item + 1;
     //     }
     // };
-    // Register<bit<32>, bit<32>>(1, 32w0) tcp_pkts_reg;
-    // RegisterAction<bit<32>, bit<32>, void>(tcp_pkts_reg) tcp_pkts_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
-    // Register<bit<32>, bit<32>>(1, 32w0) resubmit_reg;   // 记录包被标记回环/重提交的次数（单元素寄存器，初值 0）
-    // RegisterAction<bit<32>, bit<32>, void>(resubmit_reg) resubmit_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
-    // Register<bit<32>, bit<32>>(15, 32w0) ecn_1_to_7_reg;    // 统计对应的探针包
-    // RegisterAction<bit<32>, bit<32>, void>(ecn_1_to_7_reg) ecn_1_to_7_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
-    // Register<bit<32>, bit<32>>(1, 32w0) icmp_pkts_reg;     
-    // RegisterAction<bit<32>, bit<32>, void>(icmp_pkts_reg) icmp_pkts_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
-    // Register<bit<32>, bit<32>>(1, 32w0) icmp_hit_reg;       // 统计 ICMP 匹配到应答规则的次数。
-    // RegisterAction<bit<32>, bit<32>, void>(icmp_hit_reg) icmp_hit_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
-    // Register<bit<32>, bit<32>>(1, 32w0) udp_pkts_reg;
-    // RegisterAction<bit<32>, bit<32>, void>(udp_pkts_reg) udp_pkts_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
-    // Register<bit<32>, bit<32>>(1, 32w0) return_pkts_reg;
-    // RegisterAction<bit<32>, bit<32>, void>(return_pkts_reg) return_pkts_add = {
-    //     void apply(inout bit<32> item) {
-    //         item = item + 1;
-    //     }
-    // };
     
 
-
-
-
-    
 
     action swap_sender_and_target(){
         mac_addr_t temp_mac_addr   = hdr.arp.sender_mac;
@@ -473,32 +490,32 @@ control SwitchIngress(
         在交换机上拦截 ARP 请求，并伪造一个 ARP 回复（由指定的代理 MAC 地址应答），
         然后直接回给请求方。
     **/
-    action handle_arp_request(mac_addr_t arp_proxy_mac) {
-        // Send to ARP proxy
-        hdr.arp.target_mac = arp_proxy_mac;
-        hdr.ethernet.dst_addr = arp_proxy_mac;
+    // action handle_arp_request(mac_addr_t arp_proxy_mac) {
+    //     // // Send to ARP proxy
+    //     // hdr.arp.target_mac = arp_proxy_mac;
+    //     // hdr.ethernet.dst_addr = arp_proxy_mac;
 
-        hdr.arp.opcode = 2;
+    //     // hdr.arp.opcode = 2;
 
-        swap_sender_and_target();
-        do_swap_ethernet = true;
+    //     // swap_sender_and_target();
+    //     // do_swap_ethernet = true;
         
-        /* transmit from ingress port */
-        direct_forward  = true;
-        ig_intr_tm_md.ucast_egress_port = ig_intr_md.ingress_port;
-    }
+    //     // /* transmit from ingress port */
+    //     // direct_forward  = true;
+    //     // ig_intr_tm_md.ucast_egress_port = ig_intr_md.ingress_port;
+    // }
 
-    table handle_arp_table {
-        key = {
-            hdr.arp.isValid() : exact; 
-            hdr.arp.opcode : exact;    
-            hdr.arp.target_ipv4 : exact; 
-        }
-        actions = {
-            handle_arp_request;
-        }
-        size = 1024;
-    }   
+    // table handle_arp_table {
+    //     key = {
+    //         hdr.arp.isValid() : exact;
+    //         hdr.arp.opcode : exact;
+    //         hdr.arp.target_ipv4 : exact;
+    //     }
+    //     actions = {
+    //         handle_arp_request;
+    //     }
+    //     size = 1024;
+    // }
 
 
     action drop() {
@@ -539,7 +556,7 @@ control SwitchIngress(
         bit<16> wsize,             bit<8>  tcp_flag_bits,
         bit<4>  m_new_data_offset, bit<16> m_new_ipv4_len_delta,
         bit<4>  m_ack_no_opcode,   bit<4>  m_seq_no_opcode, bit<1> should_reply,
-        bit<32> m_seq_from_isn) {
+        bit<32> m_seq_from_isn, bit<16> m_tcp_option_sum) {
 
         /* IPv4 */
         new_ttl                    = ipv4_ttl;
@@ -560,7 +577,8 @@ control SwitchIngress(
         hdr.tcp.syn               = tcp_flag_bits[1:1];
         hdr.tcp.fin               = tcp_flag_bits[0:0];
         ig_md.update_tcp_checksum = true;
-        
+        ig_md.tcp_option_sum = m_tcp_option_sum;
+
         /* number opcode */
         ack_no_opcode = m_ack_no_opcode;
         seq_no_opcode = m_seq_no_opcode;
@@ -585,6 +603,7 @@ control SwitchIngress(
 
 
     action mark_packet_to_enter_confuse() { 
+        direct_forward = false;
     }
 
     action mark_packet_to_bypass_confuse() {
@@ -595,7 +614,6 @@ control SwitchIngress(
     table filter_packet_enter_confuse_table {
         key = {
             ig_md.dst_ipv4 : exact;
-
         }
         actions = {
             mark_packet_to_enter_confuse;
@@ -647,12 +665,12 @@ control SwitchIngress(
     }
 
     #define ACTION_FP_TCP_OPT_TS(X) \
-    action finger_Tcp_opt_TS_##X##() { \
+    action finger_Tcp_opt_TS_##X##(bit<32> tsval, bit<32> tsecr) { \
         hdr.ts_##X##.setValid(); \
         hdr.ts_##X##.kind  = 0x08; \
         hdr.ts_##X##.length = 0x0a; \
-        hdr.ts_##X##.tsval = 232561103; \
-        hdr.ts_##X##.tsecr = 0; \
+        hdr.ts_##X##.tsval = tsval; \
+        hdr.ts_##X##.tsecr = tsecr; \
     }
 
     #define ACTION_FP_TCP_OPT_DEL(X) \
@@ -724,13 +742,15 @@ control SwitchIngress(
     /*
         命中规则就原地生成 Echo Reply 回给对端，或直接丢弃。
     */
-    action generate_icmp_reply(bit<8> ttl) {
+    action generate_icmp_reply(bit<8> ttl, bit<1> df, bit<8> code) {
         do_swap_ethernet = true;
         do_swap_ipv4     = true;
 
         hdr.ipv4.diffserv = 0;
         hdr.ipv4.ttl = ttl;
-        hdr.icmp.code = 0;
+        hdr.icmp.code = code;
+        hdr.ipv4.df_bit = df;
+        ig_md.update_icmp_echo_checksum = true;
         hdr.icmp.icmp_type = 0;
 
         hdr.icmp.hdr_checksum = 0;
@@ -765,7 +785,7 @@ control SwitchIngress(
         hdr.deol.kind = 8w0xff;
         ig_intr_tm_md.ucast_egress_port = recirc_port;
         hdr.ipv4.protocol = IP_PROTOCOLS_RECIRC_TCP;
-        // resubmit_add.execute(0);
+
     }
     table recirc_determining_table {
         key = {
@@ -963,61 +983,68 @@ control SwitchIngress(
     apply{
         // 从发送端口发来的数据包
         if(ig_intr_md.ingress_port == send_port){
-            // 如果不是arp请求，判断是否是目的IP,设置出端口
-            if(!handle_arp_table.apply().hit) {
+            // if(handle_arp_table.apply().hit){
+            //     ig_intr_tm_md.ucast_egress_port = receive_port;
+            //     bypass_pkts_add.execute(0);
+            // }
+            if(hdr.ipv4.isValid()){
                 ipv4_fwd_table.apply();
                 filter_packet_enter_confuse_table.apply();
-            }
-            if(!direct_forward){
-                // confuse_pkts_add.execute(0);
+                if(!direct_forward){
+                    confuse_pkts_add.execute(0);
 
-                if(hdr.tcp.isValid()){
-                    // tcp_pkts_add.execute(0);
-                    recirc_determining_table.apply();
-                }
-                // 处理 ICMP Echo Request（即 ping 请求报文）
-                else if(hdr.icmp.isValid() && hdr.icmp.icmp_type == 8 &&  hdr.icmp_data.isValid()){
-                    // icmp_pkts_add.execute(0); 
-                    if(handle_icmp_table.apply().hit) {
-                        // icmp_hit_add.execute(0);
+                    if(hdr.tcp.isValid()){
+                        tcp_pkts_add.execute(0);
+                        recirc_determining_table.apply();
+                    }
+                    // 处理 ICMP Echo Request（即 ping 请求报文）
+                    else if(hdr.icmp.isValid() && hdr.icmp.icmp_type == 8 &&  hdr.icmp_data.isValid()){
+                        icmp_pkts_add.execute(0);
+                        if(handle_icmp_table.apply().hit) {
+                            icmp_hit_add.execute(0);
+                        }
+                    }
+                    // 处理“特定 UDP 探针 → 伪造 ICMP 不可达回应”的逻辑
+                    else if(hdr.udp.isValid() && hdr.ipv4.identification == 0x1042){
+                        udp_pkts_add.execute(0);
+                        do_swap_ethernet = true;
+                        do_swap_ipv4 = true;
+                        do_handle_icmp_unreachable = true;
+
+                        hdr.icmp_ipv4.setValid();
+                        hdr.icmp_ipv4 = hdr.ipv4;
+
+                        hdr.icmp.setValid();
+                        hdr.icmp.icmp_type = 3;
+                        hdr.icmp.code = 3;
+                        hdr.icmp.hdr_checksum = 0;
+
+                        hdr.icmp_data.setValid();
+                        hdr.icmp_data.id = 0;
+                        hdr.icmp_data.seq = 0;
+
+                        ig_intr_tm_md.ucast_egress_port = ig_intr_md.ingress_port;
+                    }
+                    // 处理 ICMP Unreachable（目的不可达报文） 时，对 IPv4/ICMP 头部进行修改的动作
+                    if( do_handle_icmp_unreachable) {
+                        hdr.icmp_ipv4.ttl = hdr.icmp_ipv4.ttl - 1;
+                        hdr.ipv4.ttl = 127;
+                        hdr.ipv4.total_len = hdr.ipv4.total_len + 28;
+                        hdr.ipv4.identification = 0xabab;
+                        hdr.ipv4.protocol = IP_PROTOCOLS_ICMP;
+                        ig_md.update_icmp_ipv4_checksum = true;
+                        ig_md.update_ipv4_checksum = true;
+                        ig_md.update_icmp_checksum = true;
                     }
                 }
-                // 处理“特定 UDP 探针 → 伪造 ICMP 不可达回应”的逻辑
-                else if(hdr.udp.isValid() && hdr.ipv4.identification == 0x1042){
-                    // udp_pkts_add.execute(0);
-                    do_swap_ethernet = true;
-                    do_swap_ipv4 = true;
-                    do_handle_icmp_unreachable = true;
-
-                    hdr.icmp_ipv4.setValid();
-                    hdr.icmp_ipv4 = hdr.ipv4;
-
-                    hdr.icmp.setValid();
-                    hdr.icmp.icmp_type = 3;
-                    hdr.icmp.code = 3;
-                    hdr.icmp.hdr_checksum = 0;
-
-                    hdr.icmp_data.setValid();
-                    hdr.icmp_data.id = 0;
-                    hdr.icmp_data.seq = 0;
-
-                    ig_intr_tm_md.ucast_egress_port = ig_intr_md.ingress_port;
+                else{
+                    ig_intr_tm_md.ucast_egress_port = receive_port;
+                    bypass_pkts_add.execute(0);
                 }
-                // 处理 ICMP Unreachable（目的不可达报文） 时，对 IPv4/ICMP 头部进行修改的动作
-                if( do_handle_icmp_unreachable) {
-                    hdr.icmp_ipv4.ttl = hdr.icmp_ipv4.ttl - 1;
-                    hdr.ipv4.ttl = 127;
-                    hdr.ipv4.total_len = hdr.ipv4.total_len + 28;
-                    hdr.ipv4.identification = 0xabab;
-                    hdr.ipv4.protocol = IP_PROTOCOLS_ICMP;
-                    ig_md.update_icmp_ipv4_checksum = true;
-                    ig_md.update_ipv4_checksum = true;
-                    ig_md.update_icmp_checksum = true;
-                }
-
             }
             else{
-                // bypass_pkts_add.execute(0);
+                ig_intr_tm_md.ucast_egress_port = receive_port;
+                bypass_pkts_add.execute(0);
             }
         }
         // 从循环端口来的数据包
@@ -1026,7 +1053,7 @@ control SwitchIngress(
             hdr.ipv4.protocol = IP_PROTOCOLS_TCP;
 
             if(hdr.tcp.isValid()){
-                // resubmited_add.execute(0);
+                resubmited_add.execute(0);
                 // if(ig_md.parsed_mss) parsed_mss_add.execute(0);
                 // if(ig_md.parsed_scale) parsed_scale_add.execute(0);
                 // if(ig_md.parsed_ts) parsed_ts_add.execute(0);
@@ -1111,7 +1138,7 @@ control SwitchIngress(
                     ig_md.update_tcp_checksum = true;
                 }
 
-                // ecn_1_to_7_add.execute((bit<32>) packet_seq);
+                ecn_1_to_7_add.execute((bit<32>) packet_seq);
 
                 if(packet_seq == 0){
                     ig_intr_tm_md.ucast_egress_port = receive_port;
@@ -1147,6 +1174,8 @@ control SwitchIngress(
                     APP_TABLE_FP_OB_TCP(9)
 
                     hdr.tcp.window = new_wsize;
+                } else {
+                    ig_md.update_tcp_checksum = false;
                 }
 
             }
@@ -1155,7 +1184,7 @@ control SwitchIngress(
         // 从目的端口发来的数据包
         else if(ig_intr_md.ingress_port == receive_port){
             ig_intr_tm_md.ucast_egress_port = send_port;
-            // return_pkts_add.execute(0);
+            return_pkts_add.execute(0);
         }
 
         if( hdr.ethernet.isValid() ) swap_ethernet_table.apply();
@@ -1179,10 +1208,3 @@ Pipeline(
 ) pipe;
 
 Switch(pipe) main;
-
-
-
-
-
-
-

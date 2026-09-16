@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OSDisguise · Tofino 监控台</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <link rel="stylesheet" href="/static/css/console-theme.css">
+  <script defer src="/static/vendor/lucide.min.js"></script>
+  <script defer src="/static/js/app.js?v=20260913-catalog"></script>
+</head>
+<body>
+  <aside class="rail" aria-label="主导航">
+    <a class="brand-mark" href="/" title="返回实验入口" aria-label="返回实验入口"><i data-lucide="scan-face"></i></a>
+    <nav>
+      <button class="nav-button active" data-view="overview" title="运行总览" aria-label="运行总览"><i data-lucide="layout-dashboard"></i><span>总览</span></button>
+      <button class="nav-button" data-view="events" title="探针记录" aria-label="探针记录"><i data-lucide="radar"></i><span>探针</span></button>
+      <button class="nav-button" data-view="profiles" title="指纹库" aria-label="指纹库"><i data-lucide="fingerprint"></i><span>指纹</span></button>
+      <button class="nav-button" data-view="logs" title="运行日志" aria-label="运行日志"><i data-lucide="terminal"></i><span>日志</span></button>
+    </nav>
+    <button id="logout" class="nav-button rail-bottom" title="退出登录" aria-label="退出登录"><i data-lucide="log-out"></i></button>
+  </aside>
+  <main>
+    <header class="topbar">
+      <div class="identity"><strong>OSDisguise<span class="brand-dot">.</span></strong><div class="workspace-tabs"><a class="active" href="/nmap">Nmap</a><a href="/p0f">p0f</a></div></div>
+      <div class="header-meta"><span class="host-label">TOFINO1 <b>{{ deployment.switch_label }}</b></span><span id="connection" class="badge muted">连接中</span><button class="icon-button" id="fullscreen" title="全屏" aria-label="全屏"><i data-lucide="maximize"></i></button></div>
+    </header>
+    <div id="alert" class="alert hidden" role="status"><i data-lucide="scan-line"></i><span id="alert-text"></span><button id="alert-protect">切换抗测绘 <i data-lucide="arrow-up-right"></i></button></div>
+    <div class="page-heading"><div><div class="eyebrow">NETWORK DEFENSE / LIVE WORKSPACE</div><h1 id="view-title">运行总览</h1></div><div class="clock"><span id="clock">--:--:--</span><small>本地时间 · UTC+8</small></div></div>
+
+    <section class="view" id="view-overview">
+      <div class="metrics">
+        <div class="metric"><div><span>扫描会话</span><i data-lucide="radar"></i></div><strong id="metric-scans">0</strong><small id="metric-confidence">按来源与 30 秒间隔估算</small></div>
+        <div class="metric"><div><span>匹配探针</span><i data-lucide="scan-line"></i></div><strong id="metric-probes">0</strong><small>ASIC 特征匹配累计值</small></div>
+        <div class="metric"><div><span>活跃来源</span><i data-lucide="network"></i></div><strong id="metric-sources">0</strong><small>最近 30 秒 · 基线监测模式</small></div>
+        <div class="metric state-metric"><div><span>当前运行模式</span><i data-lucide="shield"></i></div><strong id="metric-mode">未启动</strong><small id="metric-mode-detail">等待设备状态</small></div>
+      </div>
+
+      <div class="workspace-grid">
+        <section class="topology-section">
+          <div class="section-heading"><h2><i data-lucide="network"></i>防护链路</h2><span id="telemetry-badge" class="badge muted">监测暂停</span></div>
+          <div class="telemetry-scene" id="scene">
+            <canvas id="topology-canvas" aria-label="nic-1 经 Tofino 到受保护主机的网络链路"></canvas>
+            <div class="scene-topline"><span><b class="status-dot"></b> LIVE TOPOLOGY</span><span>100 GbE / DEV_PORT</span></div>
+            <div class="network-nodes">
+              <div class="network-node"><div class="device-icon endpoint"><i data-lucide="monitor"></i></div><strong>nic-1</strong><span>192.168.3.1</span><small id="port60">DEV 60 · 未读取</small></div>
+              <div class="network-node switch-node"><div class="device-icon switch"><i data-lucide="server"></i><span id="switch-led"></span></div><strong>Tofino1</strong><span id="topology-program">NO PIPELINE</span><small>可编程交换机</small></div>
+              <div class="network-node"><div class="device-icon protected"><i data-lucide="shield-check"></i></div><strong>受保护主机</strong><span>192.168.3.2</span><small id="port52">DEV 52 · 未读取</small></div>
+            </div>
+            <div class="scene-bottom"><span id="coverage">等待数据面和控制面启动</span><span id="telemetry-time">--</span></div>
+          </div>
+          <div class="os-strip">
+            <div><span class="field-label">受保护资产标签</span><strong>{{ deployment.asset_label }} <i data-lucide="monitor"></i></strong><small>实机核验：{{ deployment.verified_kernel }}</small></div>
+            <i class="os-arrow" data-lucide="arrow-right"></i>
+            <div><span class="field-label">目标伪装系统</span><strong id="target-os">读取中</strong><small id="profile-status">未下发</small></div>
+            <button id="choose-profile" class="icon-button" title="更换指纹" aria-label="更换指纹"><i data-lucide="fingerprint"></i></button>
+          </div>
+        </section>
+
+        <section class="operation-section">
+          <div class="section-heading"><h2><i data-lucide="sliders-horizontal"></i>运行控制</h2><span id="operation-status" class="badge muted">待命</span></div>
+          <div class="mode-picker" role="radiogroup" aria-label="启动模式">
+            <label><input type="radio" name="mode" value="scan_monitor" checked><span><i data-lucide="radar"></i>监测转发</span></label>
+            <label><input type="radio" name="mode" value="antiFpProbe"><span><i data-lucide="shield-check"></i>抗测绘</span></label>
+          </div>
+          <div class="program-name"><small>PROGRAM</small><code id="selected-mode">scan_monitor</code></div>
+          <ol class="startup-steps">
+            <li id="step-data"><span class="step-number">01</span><div><strong>启动数据面</strong><small id="data-pid">无运行进程</small></div><i data-lucide="circle"></i></li>
+            <li id="step-ready"><span class="step-number">02</span><div><strong>等待设备就绪</strong><small>设备初始化 · BFRT 响应</small></div><i data-lucide="circle"></i></li>
+            <li id="step-control"><span class="step-number">03</span><div><strong>控制面与链路就绪</strong><small id="control-pid">无运行进程</small></div><i data-lucide="circle"></i></li>
+          </ol>
+          <div class="operation-actions"><button id="start" class="button primary"><i data-lucide="play"></i><span>启动所选模式</span></button><button id="stop" class="icon-button stop-button" title="停止当前程序" aria-label="停止当前程序"><i data-lucide="square"></i></button></div>
+          <div id="operation-message" class="operation-message" role="status">等待启动</div>
+        </section>
+      </div>
+
+      <div class="analysis-grid">
+        <section><div class="section-heading"><h2><i data-lucide="activity"></i>探针趋势</h2><span class="muted-text">最近 30 分钟</span></div><div class="chart-area"><div class="chart-legend"><span><b></b>匹配探针 / 分钟</span><strong id="chart-peak">峰值 0</strong></div><canvas id="trend-chart" aria-label="最近三十分钟探针数量趋势"></canvas><div class="chart-time"><span>30 分钟前</span><span>15 分钟前</span><span>现在</span></div></div></section>
+        <section><div class="section-heading"><h2><i data-lucide="chart-no-axes-combined"></i>探针分类</h2><span id="category-total" class="muted-text">0 类命中</span></div><div id="probe-bars" class="probe-bars"></div></section>
+      </div>
+      <section class="recent-section"><div class="section-heading"><h2><i data-lucide="list-filter"></i>最近探针</h2><button class="text-button" data-open="events">查看全部 <i data-lucide="arrow-right"></i></button></div><div id="recent-table" class="table-scroll"></div></section>
+      <div class="footnote"><i data-lucide="info"></i><span>Nmap 识别基于探针特征，并非工具身份认证。摘要可能合并或丢失；计数以硬件为准。程序切换期间转发与监测会短暂中断。</span></div>
+    </section>
+
+    <section class="view hidden" id="view-events">
+      <div class="section-heading"><div class="inline-tabs"><button class="active" data-record="events">探针事件</button><button data-record="sessions">扫描会话</button></div><button id="export" class="button secondary"><i data-lucide="download"></i>导出数据</button></div>
+      <div class="filter-row"><div class="search-field"><i data-lucide="search"></i><input id="event-search" placeholder="搜索来源地址、目标或探针" aria-label="搜索探针"></div><span id="record-count" class="muted-text"></span></div><div id="events-table" class="table-scroll"></div>
+      <div class="footnote">监测转发模式提供来源与会话。抗测绘模式读取已有 TCP 探针计数器，不新增来源事件或扫描会话。</div>
+    </section>
+
+    <section class="view hidden" id="view-profiles">
+      <div class="section-heading"><h2>指纹库 <span id="profile-count" class="muted-text"></span></h2><button id="import-profile" class="button secondary"><i data-lucide="upload"></i>导入 JSON</button><input id="profile-file" type="file" accept=".json,application/json" hidden></div>
+      <div class="filter-row"><div class="search-field"><i data-lucide="search"></i><input id="profile-search" placeholder="搜索操作系统" aria-label="搜索指纹"></div><select id="profile-family" aria-label="操作系统家族"><option value="all">所有系统</option><option>Linux</option><option>Windows</option><option>Mac</option><option>FreeBSD</option><option>Other</option></select></div>
+      <div id="profile-grid" class="profile-grid"></div>
+      <details class="limitations"><summary><i data-lucide="info"></i>当前管线的指纹覆盖范围</summary><p>复用现有 antiFpProbe 框架。时间戳时钟、IP-ID 序列及部分 U1 字段尚不能完整仿真；目标系统名称不代表 Nmap 一定会精确识别为该系统。更换指纹时按现有控制面删除并重建规则，存在短暂更新窗口。</p><p>资产标签由部署配置指定，不等同于指纹识别结果；实机核验信息需由部署者确认后填写。</p></details>
+    </section>
+
+    <section class="view hidden" id="view-logs">
+      <div class="section-heading"><div class="inline-tabs"><button data-log="data" class="active">数据面</button><button data-log="control">控制面</button><button data-log="audit">操作记录</button></div><button id="refresh-log" class="icon-button" title="刷新日志" aria-label="刷新日志"><i data-lucide="refresh-cw"></i></button></div><pre id="log-output" class="log-output">等待选择日志</pre>
+    </section>
+    <footer><span><b class="tiny-dot"></b> OSDisguise / Tofino1</span><span>LOCAL TESTBED <span class="footer-divider">/</span> BF-SDE 9.7.0</span></footer>
+  </main>
+
+  <dialog id="login-dialog" class="login-dialog"><form id="login-form"><div class="login-brand"><i data-lucide="shield-check"></i><strong>OSDisguise.</strong></div><h2>连接监控台</h2><p>Tofino1 · {{ deployment.switch_label }}</p><label for="access-token">管理访问码</label><input id="access-token" type="password" autocomplete="current-password" required><div id="login-error" class="error-text" role="alert"></div><button class="button primary" type="submit"><i data-lucide="log-in"></i>进入工作台</button></form></dialog>
+  <dialog id="confirm-dialog"><div class="dialog-heading"><div class="dialog-icon"><i data-lucide="triangle-alert"></i></div><div><h2 id="confirm-title"></h2><p id="confirm-description"></p></div></div><div id="confirm-content"></div><div class="dialog-actions"><button id="confirm-cancel" class="button secondary">取消</button><button id="confirm-ok" class="button danger"><i data-lucide="check"></i><span>确认</span></button></div></dialog>
+  <dialog id="detail-dialog" class="detail-dialog"><div class="section-heading"><h2 id="detail-title">指纹详情</h2><button id="detail-close" class="icon-button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div><pre id="detail-content"></pre></dialog>
+  <div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>
