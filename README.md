@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./HTML/static/images/testbed-gateway.png" width="760" alt="OSDisguise programmable-switch testbed">
+  <img src="./docs/assets/osdisguise-overview.svg" width="820" alt="OSDisguise subnet-wide fingerprint disguise overview">
 </p>
 
 <h1 align="center">OSDisguise</h1>
@@ -27,6 +27,26 @@
 
 ---
 
+## 系统架构
+
+### 主动指纹伪装 - Nmap
+
+主动扫描器向受保护主机发送特制探针。交换机完成 TCP Option 循环解析、探针分类、策略匹配、响应合成和 ISN 注入，再把具有目标操作系统特征的响应返回给扫描器。
+
+<p align="center">
+  <img src="./docs/assets/osdisguise-active-workflow.svg" width="100%" alt="OSDisguise active fingerprint workflow">
+</p>
+
+### 被动指纹伪装 - p0f
+
+被动观察者不会发送探针，而是根据正常 TCP 流量推断源主机系统。OSDisguise 在转发路径中匹配业务包，应用目标指纹策略并修复校验和，使观察到的 SYN 特征与真实主机解耦。
+
+<p align="center">
+  <img src="./docs/assets/osdisguise-passive-workflow.svg" width="100%" alt="OSDisguise passive fingerprint workflow">
+</p>
+
+当前公开实验系统提供 **Nmap 主动模式、p0f 被动模式和独立监测转发模式**。
+
 OSDisguise 将操作系统指纹伪装从受保护主机迁移到网络数据面。它在 **Intel Tofino1 / Barefoot SDE 9.7.0 / P4_16** 上识别指纹探针，按目标策略重构 IP/TCP 字段与 TCP Options，并插入时间一致的 Initial Sequence Number (ISN)。受保护主机无需安装内核补丁、Netfilter 模块或常驻代理。
 
 > 论文实验结果：OSDisguise 面向数千条真实操作系统指纹进行评估，对 Nmap 和 p0f 的平均伪装成功率分别达到 **92.48%** 和 **85.97%**，同时保持 **100 Gbps** 线速转发。
@@ -47,26 +67,6 @@ OSDisguise 的核心思路是把复杂的指纹语义拆成数据面友好的操
 | **Multi-slot option construction** | 使用多个可编程槽位重构 MSS、SACK、Timestamp、Window Scale 等选项及其顺序。 |
 | **ISNG algorithm** | 在控制面离线生成满足 GCD、ISR、SP 约束的 ISN 序列，数据面仅做查表与插入。 |
 | **Match-action disguise** | 按目的主机、探针和目标 OS 选择策略，并在线完成字段改写、长度修正与校验和更新。 |
-
-## 系统架构
-
-### 主动指纹伪装 - Nmap / Xprobe2
-
-主动扫描器向受保护主机发送特制探针。交换机完成 TCP Option 循环解析、探针分类、策略匹配、响应合成和 ISN 注入，再把具有目标操作系统特征的响应返回给扫描器。
-
-<p align="center">
-  <img src="./docs/assets/osdisguise-active-workflow.svg" width="100%" alt="OSDisguise active fingerprint workflow">
-</p>
-
-### 被动指纹伪装 - p0f
-
-被动观察者不会发送探针，而是根据正常 TCP 流量推断源主机系统。OSDisguise 在转发路径中匹配业务包，应用目标指纹策略并修复校验和，使观察到的 SYN 特征与真实主机解耦。
-
-<p align="center">
-  <img src="./docs/assets/osdisguise-passive-workflow.svg" width="100%" alt="OSDisguise passive fingerprint workflow">
-</p>
-
-论文同时评估了 Nmap、p0f 与 Xprobe2；当前公开实验系统重点提供 **Nmap 主动模式、p0f 被动模式和独立监测转发模式**。
 
 ## 仓库提供什么
 
@@ -156,7 +156,7 @@ bash scripts/control.sh nmap
 **OSDisguise: Disguising OS Fingerprints Against Network Scanning in the Data Plane**<br>
 Xiaochuan Guo, Kun Xie, Ke Xu, Xin Zeng, Ziyang Peng, Jigang Wen, Yanbiao Li, Xiaocan Li, Guangxing Zhang, and Gaogang Xie.
 
-论文中的完整评估还包含 Xprobe2、消融实验、资源开销、吞吐量和面向数千受保护主机的扩展性分析。本仓库用于复现公开代码中的 Tofino1、Nmap、p0f 与监控控制台工作流。
+论文中的完整评估还包含消融实验、资源开销、吞吐量和面向数千受保护主机的扩展性分析。本仓库用于复现公开代码中的 Tofino1、Nmap、p0f 与监控控制台工作流。
 
 ## 使用边界与许可
 

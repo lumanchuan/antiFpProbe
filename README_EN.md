@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./HTML/static/images/testbed-gateway.png" width="760" alt="OSDisguise programmable-switch testbed">
+  <img src="./docs/assets/osdisguise-overview.svg" width="820" alt="OSDisguise subnet-wide fingerprint disguise overview">
 </p>
 
 <h1 align="center">OSDisguise</h1>
@@ -27,6 +27,26 @@
 
 ---
 
+## System architecture
+
+### Active fingerprint deception - Nmap
+
+An active scanner sends crafted probes to a protected host. The switch performs recirculation-based TCP Option parsing, probe classification, policy lookup, response synthesis, and ISN insertion before returning a response that carries the target OS fingerprint.
+
+<p align="center">
+  <img src="./docs/assets/osdisguise-active-workflow.svg" width="100%" alt="OSDisguise active fingerprint workflow">
+</p>
+
+### Passive fingerprint deception - p0f
+
+A passive observer infers the source OS from ordinary TCP traffic without sending probes. OSDisguise matches packets in the forwarding path, applies the selected fingerprint policy, and repairs checksums so observed SYN features are decoupled from the real host.
+
+<p align="center">
+  <img src="./docs/assets/osdisguise-passive-workflow.svg" width="100%" alt="OSDisguise passive fingerprint workflow">
+</p>
+
+The public testbed release provides **active Nmap mode, passive p0f mode, and a standalone monitoring-forwarding mode**.
+
 OSDisguise moves operating-system fingerprint deception from protected hosts into the network data plane. On **Intel Tofino1 / Barefoot SDE 9.7.0 / P4_16**, it classifies fingerprint probes, reconstructs IP/TCP fields and TCP Options according to a target policy, and inserts temporally consistent Initial Sequence Numbers (ISNs). Protected hosts require no kernel patches, Netfilter modules, or resident agents.
 
 > Results reported in the paper: evaluated with thousands of real OS fingerprints, OSDisguise reaches **92.48%** average disguise success against Nmap and **85.97%** against p0f while sustaining **100 Gbps** line-rate forwarding.
@@ -47,26 +67,6 @@ OSDisguise decomposes the fingerprinting semantics into data-plane-friendly oper
 | **Multi-slot option construction** | Rebuilds MSS, SACK, Timestamp, Window Scale, and their ordering through programmable slots. |
 | **ISNG algorithm** | Generates ISN sequences satisfying GCD, ISR, and SP constraints offline; the data plane only looks them up and inserts them. |
 | **Match-action disguise** | Selects a policy by protected host, probe, and target OS, then rewrites fields, repairs lengths, and updates checksums. |
-
-## System architecture
-
-### Active fingerprint deception - Nmap / Xprobe2
-
-An active scanner sends crafted probes to a protected host. The switch performs recirculation-based TCP Option parsing, probe classification, policy lookup, response synthesis, and ISN insertion before returning a response that carries the target OS fingerprint.
-
-<p align="center">
-  <img src="./docs/assets/osdisguise-active-workflow.svg" width="100%" alt="OSDisguise active fingerprint workflow">
-</p>
-
-### Passive fingerprint deception - p0f
-
-A passive observer infers the source OS from ordinary TCP traffic without sending probes. OSDisguise matches packets in the forwarding path, applies the selected fingerprint policy, and repairs checksums so observed SYN features are decoupled from the real host.
-
-<p align="center">
-  <img src="./docs/assets/osdisguise-passive-workflow.svg" width="100%" alt="OSDisguise passive fingerprint workflow">
-</p>
-
-The paper evaluates Nmap, p0f, and Xprobe2. The public testbed release focuses on **active Nmap mode, passive p0f mode, and a standalone monitoring-forwarding mode**.
 
 ## What this repository provides
 
@@ -156,7 +156,7 @@ See [Deployment](docs/DEPLOYMENT_EN.md) for compilation, ports, NIC kernel-drive
 **OSDisguise: Disguising OS Fingerprints Against Network Scanning in the Data Plane**<br>
 Xiaochuan Guo, Kun Xie, Ke Xu, Xin Zeng, Ziyang Peng, Jigang Wen, Yanbiao Li, Xiaocan Li, Guangxing Zhang, and Gaogang Xie.
 
-The full evaluation also covers Xprobe2, ablation studies, resource consumption, throughput, and scalability to thousands of protected hosts. This repository reproduces the public Tofino1, Nmap, p0f, monitoring, and web-console workflows.
+The full evaluation also covers ablation studies, resource consumption, throughput, and scalability to thousands of protected hosts. This repository reproduces the public Tofino1, Nmap, p0f, monitoring, and web-console workflows.
 
 ## Scope and license
 
